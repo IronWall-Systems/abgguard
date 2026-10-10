@@ -1,0 +1,15 @@
+# ---------------------------------------------------------------
+# ABG Guard - development / tooling only (NOT installed in Docker)
+#   pip install -r requirements-dev.txt
+# ---------------------------------------------------------------
+-r requirements.txt
+
+# database migrations
+aerich==0.9.3
+
+# lint + typing
+ruff==0.16.9
+orjson-stubs
+
+# tests
+pytest==8.4.2

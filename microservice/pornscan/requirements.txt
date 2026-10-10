@@ -1,0 +1,10 @@
+# ---------------------------------------------------------------
+# ABG Guard - local AI anti-porn microservice (FastAPI + NudeNet)
+# ---------------------------------------------------------------
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+python-multipart==0.0.20
+nudenet==3.0.1
+onnxruntime==1.21.1
+opencv-python-headless==4.11.0.86
+numpy==2.2.5

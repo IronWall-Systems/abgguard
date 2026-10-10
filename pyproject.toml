@@ -1,0 +1,22 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["migrations", "__pycache__"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "RUF", "PIE", "SIM"]
+ignore = [
+    "B008",    # FastAPI Depends()/File() defaults are idiomatic
+    "SIM105",  # contextlib.suppress hides the intent of "telegram said no"
+    "SIM115",  # temp file without context manager in the video sampler
+    "E501",    # formatter handles line length
+    "RUF001",  # Persian/Arabic UI strings are intentionally non-ASCII
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"microservice/pornscan/main.py" = ["SIM114"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

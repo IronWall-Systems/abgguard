@@ -1,0 +1,60 @@
+# ---- secrets / environment (CRITICAL) ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+pip-wheel-metadata/
+
+# ---- tooling caches ----
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# ---- runtime data / harvested corpora ----
+data/
+dataset/
+*.jsonl
+*.zip
+!data/.gitkeep
+!dataset/.gitkeep
+
+# ---- ML model binaries (download separately) ----
+*.onnx
+*.pt
+*.pth
+*.weights
+*.h5
+
+# ---- migrations (generated) ----
+migrations/
+
+# ---- agent / internal working notes ----
+.agent/
+
+# ---- editors / os / logs ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+logs/

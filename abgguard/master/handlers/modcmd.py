@@ -1,0 +1,595 @@
+from __future__ import annotations
+
+import html
+import logging
+import re
+
+from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.filters import Filter
+from aiogram.types import ChatPermissions, Message
+
+from abgguard.core import rbac
+from abgguard.core.rbac import Role
+from abgguard.core.redis import VIP_TTL, revoke_user_vip, set_user_vip
+from abgguard.master.ephemeral import fa_num, notice
+from abgguard.models.entities import BanLog
+from abgguard.services import moderation, modlog, strikes
+from abgguard.services.textguards import is_bot_message
+
+log = logging.getLogger("abgguard.master.modcmd")
+
+router = Router(name="master.modcmd")
+
+GROUPS = {"group", "supergroup"}
+
+DEFAULT_MUTE = 600  # 10 minutes - the same first-strike mute the guards use
+MAX_MUTE = 366 * 24 * 3600
+DEFAULT_PURGE = 20
+MAX_PURGE = 100
+REASON_LIMIT = 64  # ban_log.reason column
+
+# /mute, /سکوت and friends all resolve to the same canonical action.
+ALIASES: dict[str, str] = {
+    "mute": "mute",
+    "silence": "mute",
+    "سکوت": "mute",
+    # permanent restriction - no expiry, the member keeps read-only access
+    "full_mute": "full_mute",
+    "fullmute": "full_mute",
+    "ban": "ban",
+    "kick": "ban",
+    "بن": "ban",
+    "warn": "warn",
+    "اخطار": "warn",
+    "purge": "purge",
+    "clean": "purge",
+    "پاکسازی": "purge",
+    # hand the default send rights back after a mute
+    "unmute": "unmute",
+    "لغو سکوت": "unmute",
+    "حذف سکوت": "unmute",
+}
+
+# Default send rights restored by /unmute. `can_send_media_messages` left the
+# Bot API in 7.0 (aiogram dropped it too), so the media half of the spec maps
+# onto the granular audio/document/photo/video/video-note/voice-note flags;
+# polls are part of the same "may I send anything" set.
+DEFAULT_SEND_PERMISSIONS = ChatPermissions(
+    can_send_messages=True,
+    can_send_audios=True,
+    can_send_documents=True,
+    can_send_photos=True,
+    can_send_videos=True,
+    can_send_video_notes=True,
+    can_send_voice_notes=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+)
+
+# Hard RBAC hierarchy (rule §3) enforced in `on_mod_command`:
+#   Level 2 (Owner) / Level 3 (God) -> may ban
+#   Level 1 (Sub-Admin)             -> may only silence and warn
+BAN_NOTICE = "⚠️ شما دسترسی بن کردن ندارید."
+
+# Words that also work *without* a slash when written alone in the group.
+# Only the two triggers named by project rule 6 - "بن" stays command-only
+# because the bare word is far too common to consume silently.
+PLAIN_TRIGGERS = frozenset({"سکوت", "اخطار"})
+
+# Unmute, too, is reply-driven and staff-only: these two spellings work as a
+# bare message, "لغو سکوت" / "حذف سکوت", alongside the /unmute command.
+UNMUTE_TRIGGERS = frozenset({"لغو سکوت", "حذف سکوت"})
+
+# Reply-based VIP triggers: a staff reply containing one of these grants (or
+# revokes) the temporary 3-hour media whitelist for the replied-to member.
+VIP_GRANT_WORDS = ("ویژه", "وی‌آی‌پی")
+VIP_REVOKE_WORDS = ("لغو ویژه", "لغو وی‌آی‌پی")
+
+# Reply-driven silent cleanup: an admin answers a message with exactly one of
+# these two words and both messages disappear - no warning, no mute and no
+# confirmation notice (Clean Chat Protocol, §6). "حذف سکوت" is a different,
+# already claimed trigger, so the bare word never collides with /unmute.
+REMOVE_TRIGGERS = frozenset({"remove", "حذف"})
+
+_DURATION_RE = re.compile(r"^(\d+)\s*([smhd]?)$", re.IGNORECASE)
+
+
+# ------------------------------------------------------------------ parsing --
+def vip_action(text: str | None) -> str | None:
+    """``"revoke"`` / ``"grant"`` for the VIP reply triggers, else ``None``."""
+    raw = " ".join((text or "").split())
+    if not raw:
+        return None
+    if any(word in raw for word in VIP_REVOKE_WORDS):
+        return "revoke"
+    if any(word in raw for word in VIP_GRANT_WORDS):
+        return "grant"
+    return None
+
+
+def is_plain_trigger(text: str | None) -> bool:
+    raw = (text or "").strip()
+    if not raw or raw.startswith("/"):
+        return False
+    return raw in PLAIN_TRIGGERS or raw in UNMUTE_TRIGGERS
+
+
+def is_remove_trigger(text: str | None) -> bool:
+    """Exact match only: "remove" / "حذف", nothing longer and nothing looser."""
+    raw = (text or "").strip()
+    if not raw or raw.startswith("/"):
+        return False
+    return raw in REMOVE_TRIGGERS
+
+
+def parse_mod_command(text: str | None) -> tuple[str, str] | None:
+    """``("/mute", "30")`` for any accepted spelling, otherwise ``None``."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    if raw.startswith("/"):
+        parts = raw.split(maxsplit=1)
+        head = parts[0][1:].split("@", 1)[0].lower()
+        name = ALIASES.get(head)
+        if name is None:
+            return None
+        return name, (parts[1].strip() if len(parts) > 1 else "")
+
+    if raw in PLAIN_TRIGGERS or raw in UNMUTE_TRIGGERS:
+        return ALIASES[raw], ""
+    return None
+
+
+def parse_duration(raw: str, default: int = DEFAULT_MUTE) -> int:
+    """``"30"`` -> 1800s (minutes), ``"2h"`` -> 7200s, ``"45s"`` -> 45s."""
+    token = (raw or "").strip().split(maxsplit=1)
+    if not token:
+        return default
+    hit = _DURATION_RE.fullmatch(token[0])
+    if hit is None:
+        return default
+    amount = int(hit.group(1))
+    if amount == 0:
+        return default
+    factor = {"": 60, "s": 1, "m": 60, "h": 3600, "d": 86400}[hit.group(2).lower()]
+    return min(amount * factor, MAX_MUTE)
+
+
+def parse_count(raw: str, default: int = DEFAULT_PURGE, maximum: int = MAX_PURGE) -> int:
+    token = (raw or "").strip().split(maxsplit=1)
+    if not token or not token[0].isdigit():
+        return default
+    return max(1, min(int(token[0]), maximum))
+
+
+def resolve_target(reply_user_id: int | None, args: str) -> tuple[int | None, str]:
+    """``(target_id, remaining_args)`` - reply wins over a raw user id."""
+    rest = (args or "").strip()
+    if reply_user_id is not None:
+        return reply_user_id, rest
+    parts = rest.split()
+    if parts and parts[0].isdigit() and int(parts[0]) > 0:
+        return int(parts[0]), " ".join(parts[1:])
+    return None, rest
+
+
+def humanize(seconds: int) -> str:
+    if seconds < 60:
+        return f"{fa_num(seconds)} ثانیه"
+    if seconds < 3600:
+        minutes, extra = divmod(seconds, 60)
+        base = f"{fa_num(minutes)} دقیقه"
+        return f"{base} و {fa_num(extra)} ثانیه" if extra else base
+    if seconds < 86400:
+        hours, extra = divmod(seconds, 3600)
+        base = f"{fa_num(hours)} ساعت"
+        return f"{base} و {fa_num(extra // 60)} دقیقه" if extra // 60 else base
+    days, extra = divmod(seconds, 86400)
+    base = f"{fa_num(days)} روز"
+    return f"{base} و {fa_num(extra // 3600)} ساعت" if extra // 3600 else base
+
+
+def _mention(user_id: int, name: str | None = None) -> str:
+    label = html.escape(name or str(user_id))
+    return f'<a href="tg://user?id={user_id}">{label}</a>'
+
+
+# ------------------------------------------------------------------- filter --
+class ModTrigger(Filter):
+    """
+    Matches only the moderation commands.
+
+    A bare Persian trigger ("سکوت", "اخطار", "لغو سکوت", "حذف سکوت") is matched
+    only for staff, so an ordinary member typing the same words keeps flowing
+    through the normal text guards instead of being swallowed by this router.
+    """
+
+    async def __call__(self, message: Message) -> bool:
+        parsed = parse_mod_command(message.text)
+        if parsed is None:
+            return False
+        if not is_plain_trigger(message.text):
+            return True
+        user, chat = message.from_user, message.chat
+        if user is None or chat is None or is_bot_message(message):
+            return False
+        return await rbac.get_role(chat.id, user.id) >= Role.SUBADMIN
+
+
+class VipTrigger(Filter):
+    """
+    Matches a *reply* carrying a VIP trigger, written by staff only (Level 1-3).
+
+    Requiring the reply keeps the plain word out of ordinary conversation: a
+    member typing "ویژه" keeps flowing through the normal text guards.
+    """
+
+    async def __call__(self, message: Message) -> bool:
+        if message.reply_to_message is None:
+            return False
+        if vip_action(message.text) is None:
+            return False
+        user, chat = message.from_user, message.chat
+        if user is None or chat is None or is_bot_message(message):
+            return False
+        return await rbac.get_role(chat.id, user.id) >= Role.SUBADMIN
+
+
+class RemoveTrigger(Filter):
+    """
+    Matches a *reply* reading exactly ``"remove"`` / ``"حذف"``, staff only.
+
+    The reply is mandatory: the same word typed on its own stays ordinary
+    conversation and keeps flowing through the normal text guards. A member
+    (Level 0) never activates it either - the RBAC check below is the whole
+    permission gate, so no refusal notice is ever sent for them.
+    """
+
+    async def __call__(self, message: Message) -> bool:
+        if message.reply_to_message is None:
+            return False
+        if not is_remove_trigger(message.text):
+            return False
+        user, chat = message.from_user, message.chat
+        if user is None or chat is None or is_bot_message(message):
+            return False
+        return await rbac.get_role(chat.id, user.id) >= Role.SUBADMIN
+
+
+router.message.filter(F.chat.type.in_(GROUPS), F.text)
+
+
+# ------------------------------------------------------------------- utils ---
+async def _ack_delete(message: Message, bot) -> None:
+    """Rule 6: the trigger itself disappears the moment it is seen."""
+    await moderation.safe_delete(bot, message.chat.id, message.message_id)
+
+
+async def _log_action(chat_id: int, user_id: int, reason: str) -> None:
+    try:
+        await BanLog.create(chat_id=chat_id, user_id=user_id, reason=reason[:REASON_LIMIT])
+    except Exception:
+        log.exception("failed to persist moderation log")
+
+
+async def _check_target(bot, chat_id: int, actor: int, actor_role: Role, target: int) -> str | None:
+    if target == actor:
+        return "❌ نمی‌توانید این دستور را روی خودتان اجرا کنید."
+    if target == (await bot.me()).id:
+        return "❌ این دستور روی ربات اجرا نمی‌شود."
+    target_role = await rbac.get_role(chat_id, target)
+    if target_role >= actor_role:
+        return "❌ این کاربر هم‌سطح یا بالاتر از شماست؛ اجازه اجرا ندارید."
+    return None
+
+
+async def _drop_replied(message: Message, bot) -> None:
+    reply = message.reply_to_message
+    if reply is not None:
+        await moderation.safe_delete(bot, message.chat.id, reply.message_id)
+
+
+def _actor(message: Message) -> int | None:
+    user = message.from_user
+    return user.id if user is not None else None
+
+
+def _target_name(message: Message, target: int) -> str | None:
+    """Display name of the replied-to member, when the command answered a reply."""
+    reply = message.reply_to_message
+    user = reply.from_user if reply is not None else None
+    if user is not None and user.id == target:
+        return user.full_name
+    return None
+
+
+# ------------------------------------------------------------------ actions --
+async def _do_mute(message: Message, bot, target: int, args: str) -> None:
+    chat_id = message.chat.id
+    seconds = parse_duration(args)
+    if not await moderation.mute(bot, chat_id, target, seconds):
+        await notice(message, "❌ سکوت اعمال نشد؛ سطح دسترسی ربات یا وضعیت کاربر مناسب نیست.")
+        return
+    await _log_action(chat_id, target, f"mute:سکوت دستی:{seconds}s")
+    await _drop_replied(message, bot)
+    await notice(
+        message,
+        f"🔇 {_mention(target)} تا {humanize(seconds)} سکوت شد.",
+    )
+    modlog.notify(
+        bot,
+        chat_id,
+        action=f"سکوت {humanize(seconds)}",
+        target=target,
+        actor=_actor(message),
+        actor_source="admin",
+        reason="سکوت دستی",
+    )
+
+
+async def _do_full_mute(message: Message, bot, target: int) -> None:
+    """Permanent restriction: keeps the member, removes every send right."""
+    chat_id = message.chat.id
+    if not await moderation.perm_mute(bot, chat_id, target):
+        await notice(message, "❌ سکوت دائم اعمال نشد؛ سطح دسترسی ربات یا وضعیت کاربر مناسب نیست.")
+        return
+    await _log_action(chat_id, target, "سکوت دائم")
+    await _drop_replied(message, bot)
+    await notice(message, f"🔇 {_mention(target)} برای همیشه سکوت شد.")
+    modlog.notify(
+        bot,
+        chat_id,
+        action="سکوت دائم",
+        target=target,
+        actor=_actor(message),
+        actor_source="admin",
+        reason="سکوت دائم",
+    )
+
+
+async def _do_unmute(
+    message: Message, bot, target: int, target_name: str | None = None
+) -> None:
+    """Hand the default send rights back - the exact reverse of a permanent mute."""
+    chat_id = message.chat.id
+    try:
+        await bot.restrict_chat_member(
+            chat_id=chat_id,
+            user_id=target,
+            permissions=DEFAULT_SEND_PERMISSIONS,
+        )
+    except (TelegramBadRequest, TelegramForbiddenError):
+        await notice(
+            message,
+            "❌ لغو سکوت اعمال نشد؛ سطح دسترسی ربات یا وضعیت کاربر مناسب نیست.",
+        )
+        return
+    await notice(
+        message,
+        f"🔊 سکوت کاربر {_mention(target, target_name)} با موفقیت لغو شد.",
+        delay=7.0,
+    )
+    log.info("UNMUTE by %s on %s -> %s", _actor(message), chat_id, target)
+
+
+async def _do_ban(message: Message, bot, target: int) -> None:
+    chat_id = message.chat.id
+    if not await moderation.ban(bot, chat_id, target):
+        await notice(message, "❌ بن اعمال نشد؛ سطح دسترسی ربات یا وضعیت کاربر مناسب نیست.")
+        return
+    await _log_action(chat_id, target, "بن دستی")
+    await _drop_replied(message, bot)
+    await notice(message, f"🚫 {_mention(target)} از گروه بن شد.")
+    modlog.notify(
+        bot,
+        chat_id,
+        action="بن",
+        target=target,
+        actor=_actor(message),
+        actor_source="admin",
+        reason="بن دستی",
+    )
+
+
+async def _do_warn(message: Message, bot, target: int, target_name: str | None = None) -> None:
+    """Same ladder as the automatic guards.
+
+    1st strike -> timed mute. Hitting the ceiling never bans: the member is
+    muted forever and the assigned Level 2 (Owner) gets a private alert to
+    make the final «بن» call.
+    """
+    chat_id = message.chat.id
+    strike = await strikes.register(chat_id, target)
+
+    if strike <= 1:
+        if not await moderation.mute(bot, chat_id, target, DEFAULT_MUTE):
+            await notice(message, "❌ اخطار ثبت نشد؛ سطح دسترسی ربات مناسب نیست.")
+            return
+        await _log_action(chat_id, target, f"mute:اخطار دستی:{DEFAULT_MUTE}s")
+        await _drop_replied(message, bot)
+        await notice(
+            message,
+            f"⚠️ اخطار ۱ برای {_mention(target)}\n"
+            f"تا {humanize(DEFAULT_MUTE)} سکوت است؛ "
+            "اخطار بعدی = سکوت دائم.",
+        )
+        modlog.notify(
+            bot,
+            chat_id,
+            action=f"اخطار {strike} — سکوت {humanize(DEFAULT_MUTE)}",
+            target=target,
+            actor=_actor(message),
+            actor_source="admin",
+            reason="اخطار دستی",
+        )
+        return
+
+    reason = f"اخطار دستی ({strike})"
+    if not await moderation.perm_mute(bot, chat_id, target):
+        await notice(message, "❌ اخطار اعمال نشد؛ سطح دسترسی ربات مناسب نیست.")
+        return
+    await _log_action(chat_id, target, f"سکوت دائم:{reason}")
+    await _drop_replied(message, bot)
+    await notice(
+        message,
+        f"🔇 اخطار {fa_num(strike)} برای {_mention(target)}\n"
+        "به دلیل تکرار تخلف برای همیشه سکوت شد؛ "
+        "تصمیم نهایی با مالک گروه است.",
+    )
+    modlog.notify(
+        bot,
+        chat_id,
+        action=f"اخطار {strike} — سکوت دائم",
+        target=target,
+        actor=_actor(message),
+        actor_source="admin",
+        reason=reason,
+    )
+    modlog.escalate(
+        bot,
+        chat_id,
+        target=target,
+        reason=reason,
+        target_name=target_name,
+    )
+
+
+async def _do_purge(message: Message, bot, args: str) -> None:
+    chat_id = message.chat.id
+    count = parse_count(args)
+    start = message.message_id - 1
+    ids = list(range(start, max(0, start - count), -1))
+    if not ids:
+        await notice(message, "🧹 پیامی برای پاکسازی وجود ندارد.")
+        return
+    try:
+        done = await bot.delete_messages(chat_id, ids)
+    except Exception as exc:
+        log.debug("bulk purge failed (%s), falling back to one-by-one", exc)
+        done = 0
+        for message_id in ids:
+            done += int(await moderation.safe_delete(bot, chat_id, message_id))
+    await notice(
+        message,
+        f"🧹 پاکسازی انجام شد؛ {fa_num(count if done else 0)} پیام اخیر حذف شد.",
+    )
+
+
+# ----------------------------------------------------------------- handler ---
+@router.message(ModTrigger())
+async def on_mod_command(message: Message, bot: Bot) -> None:
+    parsed = parse_mod_command(message.text)
+    actor = message.from_user
+    chat = message.chat
+    if parsed is None or actor is None or chat is None or is_bot_message(message):
+        return
+
+    name, args = parsed
+    role = await rbac.get_role(chat.id, actor.id)
+
+    if role < Role.SUBADMIN:
+        # only reachable through an explicit slash command - give feedback
+        await _ack_delete(message, bot)
+        await notice(message, "❌ فقط تیم مدیریت گروه می‌تواند از دستورات اعمال قانون استفاده کند.")
+        return
+
+    await _ack_delete(message, bot)
+
+    if name == "ban" and role < Role.ADMIN:
+        # rule §3: Level 1 may silence and warn, never remove a member.
+        await notice(message, BAN_NOTICE)
+        return
+
+    if name == "purge":
+        await _do_purge(message, bot, args)
+        return
+
+    target, rest = resolve_target(
+        message.reply_to_message.from_user.id if message.reply_to_message else None,
+        args,
+    )
+    if target is None:
+        await notice(
+            message,
+            "❌ روی پیام کاربر ریپلای کنید یا شناسه عددی او را بنویسید:\n"
+            "<code>/mute 30</code> یا ریپلای + <code>/mute</code>",
+        )
+        return
+
+    problem = await _check_target(bot, chat.id, actor.id, role, target)
+    if problem is not None:
+        await notice(message, problem)
+        return
+
+    if name == "mute":
+        await _do_mute(message, bot, target, rest)
+    elif name == "full_mute":
+        await _do_full_mute(message, bot, target)
+    elif name == "unmute":
+        await _do_unmute(message, bot, target, _target_name(message, target))
+    elif name == "ban":
+        await _do_ban(message, bot, target)
+    else:
+        await _do_warn(message, bot, target, _target_name(message, target))
+
+    log.info("MOD %s by %s on %s -> %s", name.upper(), actor.id, chat.id, target)
+
+
+# --------------------------------------------------------- silent cleanup ---
+@router.message(RemoveTrigger())
+async def on_remove_command(message: Message, bot: Bot) -> None:
+    """Delete the replied-to message, then the trigger itself - nothing else.
+
+    No warning, no mute, no confirmation: this is a silent cleanup tool for
+    Level 1-3 staff (rule §6 - the chat looks untouched afterwards). The
+    filter already required the reply, the exact word and the staff rank; the
+    checks below only keep the handler safe on its own.
+    """
+    actor = message.from_user
+    chat = message.chat
+    if actor is None or chat is None or is_bot_message(message):
+        return
+    if await rbac.get_role(chat.id, actor.id) < Role.SUBADMIN:
+        return
+
+    reply = message.reply_to_message
+    removed: int | None = None
+    if reply is not None and not is_bot_message(reply):
+        # rule §9: a bot's own output (panel, notice) is never deleted here
+        removed = reply.message_id
+        await moderation.safe_delete(bot, chat.id, reply.message_id)
+
+    await _ack_delete(message, bot)
+    log.info("REMOVE by %s on %s -> msg %s", actor.id, chat.id, removed)
+
+
+# --------------------------------------------------------- temporary VIP ----
+@router.message(VipTrigger())
+async def on_vip_command(message: Message, bot: Bot) -> None:
+    action = vip_action(message.text)
+    reply = message.reply_to_message
+    actor = message.from_user
+    chat = message.chat
+    target = reply.from_user if reply is not None else None
+    if action is None or actor is None or chat is None or target is None:
+        return
+
+    await _ack_delete(message, bot)
+    mention = _mention(target.id, target.full_name)
+
+    if action == "revoke":
+        await revoke_user_vip(chat.id, target.id)
+        await notice(message, f"🚫 وضعیت ویژهٔ {mention} لغو شد.", delay=7.0)
+        log.info("VIP REVOKE by %s on %s -> %s", actor.id, chat.id, target.id)
+        return
+
+    await set_user_vip(chat.id, target.id, VIP_TTL)
+    await notice(
+        message,
+        f"🌟 کاربر {mention} به مدت ۳ ساعت کاربر ویژه شد و می‌تواند رسانه ارسال کند.",
+        delay=7.0,
+    )
+    log.info("VIP GRANT by %s on %s -> %s", actor.id, chat.id, target.id)

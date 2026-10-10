@@ -1,0 +1,93 @@
+services:
+  # ------------------------------------------------------------------ db --
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-abg_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-abgguard_db}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-abg_user} -d ${POSTGRES_DB:-abgguard_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # ---------------------------------------------------------------- redis --
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    command:
+      ["redis-server", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # ------------------------------------------------------------ pornscan --
+  pornscan:
+    build:
+      context: ./microservice/pornscan
+      args:
+        # set PORNSCAN_WITH_YOLO=1 in .env to switch PORNSCAN_MODEL=yolo
+        WITH_YOLO: ${PORNSCAN_WITH_YOLO:-0}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    environment:
+      PORNSCAN_MODEL: ${PORNSCAN_MODEL:-nudenet}
+      PORNSCAN_DEVICE: ${PORNSCAN_DEVICE:-cpu}
+    ports:
+      - "127.0.0.1:8010:8010"
+    volumes:
+      - modelcache:/root/.cache
+
+  # ---------------------------------------------------------- abgguard ----
+  abgguard:
+    build: .
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    env_file: .env
+    # in-network overrides: .env may point at db/redis for compose, and these
+    # values always win inside the container network.
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      REDIS_URL: redis://redis:6379/0
+      PORN_API_URL: http://pornscan:8010/detect
+      RUN_MODE: polling
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pornscan:
+        condition: service_started
+    volumes:
+      - ./dataset:/app/dataset
+      - ./data:/app/data
+
+volumes:
+  pgdata:
+  modelcache:

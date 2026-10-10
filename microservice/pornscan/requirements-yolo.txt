@@ -1,0 +1,5 @@
+# ---------------------------------------------------------------
+# optional: YOLO NSFW backend (PORNSCAN_MODEL=yolo) - pulls torch
+#   pip install -r requirements-yolo.txt
+# ---------------------------------------------------------------
+ultralytics==8.3.101
