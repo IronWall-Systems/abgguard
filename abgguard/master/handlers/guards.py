@@ -15,6 +15,8 @@ from abgguard.services.moderation import (
     delete_after,
     delete_and_ban,
     delete_and_mute,
+    mute,
+    publish_ban_event,
     safe_delete,
 )
 from abgguard.services.textguards import find_emoji, find_link, is_bot_message
@@ -29,6 +31,24 @@ router.message.filter(
 )
 
 MSG_CACHE_TTL = 7 * 24 * 3600
+
+# Escalating mute durations (seconds) keyed by strike count.
+# Strikes 1-4: no mute (delete only). Strike 5+: progressive mute.
+_STRIKE_MUTE_SECONDS: dict[int, int] = {
+    5: 300,      # 5 minutes
+    6: 600,      # 10 minutes
+    7: 1800,     # 30 minutes
+    8: 3600,     # 1 hour
+}
+_STRIKE_MUTE_DEFAULT = 86400  # 24 hours for strike 9+
+
+_STRIKE_DURATION_TEXT: dict[int, str] = {
+    5: "۵ دقیقه",
+    6: "۱۰ دقیقه",
+    7: "۳۰ دقیقه",
+    8: "۱ ساعت",
+}
+_STRIKE_DURATION_DEFAULT = "۲۴ ساعت"
 
 
 def _k_msg(chat_id: int, message_id: int) -> str:
@@ -68,63 +88,77 @@ async def _escalate(
     message_id: int,
     reason: str,
     log_reason: str | None = None,
-    first_mute: int = 600,
     target_name: str | None = None,
     target_username: str | None = None,
     content_report: bool = False,
     message_text: str | None = None,
 ) -> None:
-    """1st strike -> timed mute, repeat strike -> permanent mute + Level 2 alert.
+    """Escalating strike system for profanity & NSFW violations.
 
-    ``reason`` is the public wording and must never carry the matched bad word;
-    ``log_reason`` (optional) is the exact private ModLog reason for admins.
-    ``message_text`` is the raw user message, logged verbatim in the ModLog.
-    The bot never bans: hitting the ceiling silences the member forever and
-    hands the final «بن» decision to the assigned group owner in private.
+    Always deletes the offending message, then increments a Redis strike
+    counter (TTL 24h). Mutes only when strike >= 5 with progressive duration.
+    Sends an auto-deleting public warning and a PV ModLog card.
     """
     private_reason = log_reason or reason
     await safe_delete(bot, chat_id, message_id)
     await _mark_dirty(chat_id, message_id)
-    strike = await strikes.register(chat_id, user_id)
 
-    if strike <= 1:
-        await delete_and_mute(
-            bot,
-            chat_id=chat_id,
-            user_id=user_id,
-            message_id=None,
-            seconds=first_mute,
-            reason=private_reason,
-            actor_source="master",
-            target_name=target_name,
-            target_username=target_username,
-            content_report=content_report,
+    # Increment strike counter (24h TTL).
+    strike_key = rk.k_strike(chat_id, user_id)
+    r = rk.get_redis()
+    strike_count = await r.incr(strike_key)
+    if strike_count == 1:
+        await r.expire(strike_key, 86400)
+
+    # Determine mute duration based on strike count.
+    mute_seconds = _STRIKE_MUTE_SECONDS.get(strike_count, _STRIKE_MUTE_DEFAULT)
+    should_mute = strike_count >= 5
+
+    # Build public warning text.
+    mention = _mention_id(user_id)
+    if strike_count < 5:
+        warning_text = (
+            f"⚠️ کاربر {mention}، پیام شما به دلیل محتوای نامناسب پاک شد. "
+            f"(اخطار {strike_count}/4)"
         )
-        try:
-            warning = await bot.send_message(
-                chat_id,
-                f"⚠️ اخطار ۱ برای {_mention_id(user_id)}\n"
-                f"دلیل: {reason}\n"
-                f"تا {first_mute // 60} دقیقه سکوت.",
-            )
-            # Auto-delete the public warning after 30s to keep the group clean.
-            _spawn(delete_after(bot, chat_id, warning.message_id, 30.0), name="warn-clean")
-        except Exception:
-            pass
-        return
+    else:
+        duration_text = _STRIKE_DURATION_TEXT.get(strike_count, _STRIKE_DURATION_DEFAULT)
+        warning_text = (
+            f"🔇 کاربر {mention} به دلیل تکرار تخلف ({strike_count} بار) "
+            f"به مدت {duration_text} سکوت شد."
+        )
 
-    await delete_and_ban(
-        bot,
+    # Apply mute if strike >= 5.
+    if should_mute:
+        await mute(bot, chat_id, user_id, mute_seconds)
+
+    # Send auto-deleting public warning.
+    try:
+        warning = await bot.send_message(chat_id, warning_text)
+        _spawn(delete_after(bot, chat_id, warning.message_id, 30.0), name="warn-clean")
+    except Exception:
+        pass
+
+    # Queue the sanction event for the ModLog PV card.
+    action_taken = (
+        "حذف پیام فقط"
+        if not should_mute
+        else f"سکوت {mute_seconds // 60} دقیقه"
+        if mute_seconds < 86400
+        else "سکوت ۲۴ ساعته"
+    )
+    await publish_ban_event(
         chat_id=chat_id,
         user_id=user_id,
-        message_id=None,
         reason=private_reason,
-        notify=f"🔇 {_mention_id(user_id)} به دلیل تکرار تخلف ({reason}) "
-        "برای همیشه سکوت شد؛ تصمیم نهایی با مالک گروه است.",
+        message_id=message_id,
         actor_source="master",
         target_name=target_name,
         target_username=target_username,
         content_report=content_report,
+        message_text=message_text,
+        strike_count=strike_count,
+        action_taken=action_taken,
     )
 
 
@@ -221,7 +255,6 @@ async def guard_text(message: Message, bot: Bot) -> None:
                 user_id=user.id,
                 message_id=message.message_id,
                 reason=kind.fa,
-                first_mute=600,
                 target_name=user.full_name,
                 target_username=user.username,
                 message_text=text,
@@ -289,7 +322,6 @@ async def guard_text(message: Message, bot: Bot) -> None:
             message_id=message.message_id,
             reason="کلمه رکیک",
             log_reason=f"کلمه رکیک ({hit})",
-            first_mute=600,
             target_name=user.full_name,
             target_username=user.username,
             content_report=True,

@@ -145,6 +145,8 @@ def render_report(
     target_name: str | None = None,
     target_username: str | None = None,
     message_text: str | None = None,
+    strike_count: int | None = None,
+    action_taken: str | None = None,
 ) -> str:
     """The content-violation report: names the Telegram username + numeric id."""
     label = html.escape(target_name) if target_name else str(target)
@@ -158,6 +160,10 @@ def render_report(
         f"⚖️ اقدام ربات: {html.escape(action)}",
         f"📝 علت: {html.escape(reason)}",
     ]
+    if strike_count is not None:
+        lines.append(f"⚠️ تعداد تخلف امروز: {strike_count}")
+    if action_taken:
+        lines.append(f"⚖️ اقدام ربات: {html.escape(action_taken)}")
     if message_text:
         lines.append(f"💬 متن اصلی پیام: {html.escape(message_text)}")
     return "\n".join(lines)
@@ -197,6 +203,8 @@ async def deliver(
     target_name: str | None = None,
     target_username: str | None = None,
     message_text: str | None = None,
+    strike_count: int | None = None,
+    action_taken: str | None = None,
 ) -> int:
     """Send the card to every assigned admin; returns how many got it.
 
@@ -220,6 +228,8 @@ async def deliver(
             target_name=target_name,
             target_username=target_username,
             message_text=message_text,
+            strike_count=strike_count,
+            action_taken=action_taken,
         )
     else:
         text = render(
@@ -413,6 +423,8 @@ def notify(
     target_name: str | None = None,
     target_username: str | None = None,
     message_text: str | None = None,
+    strike_count: int | None = None,
+    action_taken: str | None = None,
 ) -> None:
     """Schedule the private fan-out without ever blocking the caller (§7).
 
@@ -438,6 +450,8 @@ def notify(
             target_name=target_name,
             target_username=target_username,
             message_text=message_text,
+            strike_count=strike_count,
+            action_taken=action_taken,
         ),
         name=f"modlog:{chat_id}",
     )

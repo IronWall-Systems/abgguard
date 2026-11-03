@@ -24,3 +24,18 @@
 ### API & Call Manager Adjustments
 - Removed MTProto Call Manager from Guard; group calls handled by playerbot project.
 - Wipe command configured to use Local Telegram Bot API on `http://127.0.0.1:8081` for >48h deletions and bulk purges.
+
+## 2026-11-03 — Dataset Collector & Escalating Strike System
+
+### 50MB JSONL LLM Dataset Collector (`services/harvester.py`)
+- `DatasetHarvester` silently records natural group conversations as JSONL pairs (`{"context", "reply", "chat", "user", "msg", "ts}`).
+- Automatic rotation at exactly 50 MB (`DATASET_MAX_BYTES`): ZIP-compresses into `./dataset`, removes the source file, opens a new file — all inside an asyncio lock with zero message loss.
+- Zero-disk retention: every archive is shipped to the God Admin's private chat as a document; wiped from local disk only after Telegram confirms upload. Failed uploads keep the file and notify the God Admin.
+- God Admin manual trigger: `rotate_now()` backs the PV button `[🟣 تخلیه دستی و فشرده‌سازی]` for on-demand ZIP rotation and delivery.
+
+### 24-Hour Redis Escalating Strike System (`core/redis.py`, `master/handlers/guards.py`)
+- New `k_strike(chat_id, user_id)` key (`abg:strikes:{chat_id}:{user_id}`) with 86400s (24h) TTL.
+- On every profanity/NSFW violation: message is always deleted immediately, then the strike counter is incremented.
+- Escalating mute durations: Strikes 1-4 → delete only (no mute). Strike 5 → 5 min, Strike 6 → 10 min, Strike 7 → 30 min, Strike 8 → 1 hour, Strike 9+ → 24 hours.
+- Auto-deleting public warning (30s) shows strike count: `"⚠️ کاربر {mention}، پیام شما به دلیل محتوای نامناسب پاک شد. (اخطار {strike_count}/4)"` for strikes < 5, or `"🔇 کاربر {mention} به دلیل تکرار تخلف ({strike_count} بار) به مدت {duration_text} سکوت شد."` for strikes >= 5.
+- PV ModLog card includes `⚠️ تعداد تخلف امروز: {strike_count}` and `⚖️ اقدام ربات: {action_taken}`.

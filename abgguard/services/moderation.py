@@ -210,6 +210,8 @@ async def publish_ban_event(
     target_username: str | None = None,
     content_report: bool = False,
     message_text: str | None = None,
+    strike_count: int | None = None,
+    action_taken: str | None = None,
 ) -> None:
     payload = json.dumps(
         {
@@ -228,6 +230,9 @@ async def publish_ban_event(
             "content_report": content_report,
             # verbatim user message for the ModLog card
             "message_text": message_text,
+            # escalating strike info
+            "strike_count": strike_count,
+            "action_taken": action_taken,
             "ts": datetime.now(UTC).isoformat(timespec="seconds"),
         }
     )
@@ -265,6 +270,10 @@ async def handle_ban_event(bot: Bot, raw: str, me_id: int) -> None:
         content_report = bool(data.get("content_report"))
         raw_message_text = data.get("message_text")
         message_text = str(raw_message_text) if raw_message_text else None
+        raw_strike_count = data.get("strike_count")
+        strike_count = int(raw_strike_count) if raw_strike_count is not None else None
+        raw_action_taken = data.get("action_taken")
+        action_taken = str(raw_action_taken) if raw_action_taken else None
     except (ValueError, KeyError, TypeError):
         log.error("malformed ban event: %s", raw[:200])
         return
@@ -345,6 +354,8 @@ async def handle_ban_event(bot: Bot, raw: str, me_id: int) -> None:
         actor_source=actor_source,
         reason=reason,
         message_text=message_text,
+        strike_count=strike_count,
+        action_taken=action_taken,
         **extra,
     )
 

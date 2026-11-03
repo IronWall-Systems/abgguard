@@ -84,6 +84,15 @@ def k_user_vip(chat_id: int, user_id: int) -> str:
     return f"{GROUP}:{chat_id}:vip:{user_id}"
 
 
+# ---- Escalating strike system (24h TTL) ------------------------------------
+STRIKE = f"{P}:strikes"  # + :{chat_id}:{user_id} -> int counter, TTL 86400s
+
+
+def k_strike(chat_id: int, user_id: int) -> str:
+    """abg:strikes:{chat_id}:{user_id} -> escalating strike counter (TTL 24h)."""
+    return f"{STRIKE}:{chat_id}:{user_id}"
+
+
 # ---- SaaS subscription mirror + distributed heartbeat -----------------------
 SUB = f"{P}:sub"                             # + :{chat_id} -> hash(status, expires)
 HEARTBEAT_MASTER = f"{P}:heartbeat:master"   # TTL'd key, refreshed by the master
