@@ -93,6 +93,15 @@ def k_strike(chat_id: int, user_id: int) -> str:
     return f"{STRIKE}:{chat_id}:{user_id}"
 
 
+# ---- Hierarchical RBAC role storage ----------------------------------------
+ROLE = f"{P}:role"  # + :{chat_id}:{user_id} -> role string
+
+
+def k_role(chat_id: int, user_id: int) -> str:
+    """abg:role:{chat_id}:{user_id} -> hierarchical role string."""
+    return f"{ROLE}:{chat_id}:{user_id}"
+
+
 # ---- SaaS subscription mirror + distributed heartbeat -----------------------
 SUB = f"{P}:sub"                             # + :{chat_id} -> hash(status, expires)
 HEARTBEAT_MASTER = f"{P}:heartbeat:master"   # TTL'd key, refreshed by the master

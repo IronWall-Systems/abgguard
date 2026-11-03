@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Filter
 from aiogram.types import ChatPermissions, Message
 
-from abgguard.core import rbac
+from abgguard.core import hierarchy, rbac
 from abgguard.core.rbac import Role
 from abgguard.core.redis import VIP_TTL, revoke_user_vip, set_user_vip
 from abgguard.master.ephemeral import fa_num, notice
@@ -376,8 +376,34 @@ def _target_name(message: Message, target: int) -> str | None:
 
 # ------------------------------------------------------------------ actions --
 async def _do_mute(message: Message, bot, target: int, args: str) -> None:
+    """Dynamic mute: 'سکوت' alone -> 30 min; 'سکوت X' -> X hours."""
     chat_id = message.chat.id
-    seconds = parse_duration(args)
+    actor = message.from_user
+    if actor is None:
+        return
+
+    # Moderation validation: only God, Deputy, Senior Chat, Chat Admin may mute
+    actor_role = await hierarchy.get_role(chat_id, actor.id)
+    if actor_role not in {
+        hierarchy.Role.GOD,
+        hierarchy.Role.DEPUTY,
+        hierarchy.Role.SENIOR_CHAT,
+        hierarchy.Role.ADMIN_CHAT,
+    }:
+        await notice(message, "❌ شما مجوز سکوت کردن ندارید.", delay=7.0)
+        return
+
+    # Parse duration: bare 'سکوت' -> 30 min; 'سکوت X' -> X hours
+    raw = (args or "").strip()
+    if not raw:
+        seconds = 1800  # 30 minutes default
+    else:
+        try:
+            hours = int(raw)
+            seconds = 1800 if hours <= 0 else hours * 3600
+        except ValueError:
+            seconds = 1800
+
     if not await moderation.mute(bot, chat_id, target, seconds):
         await notice(message, "❌ سکوت اعمال نشد؛ سطح دسترسی ربات یا وضعیت کاربر مناسب نیست.")
         return
@@ -445,6 +471,21 @@ async def _do_unmute(
 
 async def _do_ban(message: Message, bot, target: int) -> None:
     chat_id = message.chat.id
+    actor = message.from_user
+    if actor is None:
+        return
+
+    # Moderation validation: only God, Deputy, Senior Chat, Senior Call may ban
+    actor_role = await hierarchy.get_role(chat_id, actor.id)
+    if actor_role not in {
+        hierarchy.Role.GOD,
+        hierarchy.Role.DEPUTY,
+        hierarchy.Role.SENIOR_CHAT,
+        hierarchy.Role.SENIOR_CALL,
+    }:
+        await notice(message, "❌ شما مجوز بن کردن ندارید.", delay=7.0)
+        return
+
     if not await moderation.ban(bot, chat_id, target):
         await notice(message, "❌ بن اعمال نشد؛ سطح دسترسی ربات یا وضعیت کاربر مناسب نیست.")
         return
@@ -542,23 +583,33 @@ async def _do_wipe(message: Message, bot) -> None:
     if start > end:
         start, end = end, start
 
+    deleted = 0
     for chunk_start in range(start, end + 1, 100):
         chunk = list(range(chunk_start, min(chunk_start + 100, end + 1)))
         try:
-            await bot.delete_messages(message.chat.id, chunk)
+            ok = await bot.delete_messages(message.chat.id, chunk)
+            if ok:
+                deleted += len(chunk)
+            else:
+                # delete_messages returned False - at least one ID was invalid.
+                # Fall back to one-by-one deletion for this chunk.
+                for message_id in chunk:
+                    if await moderation.safe_delete(bot, message.chat.id, message_id):
+                        deleted += 1
         except Exception as exc:
             log.debug("wipe chunk failed (%s), falling back to one-by-one", exc)
             for message_id in chunk:
-                await moderation.safe_delete(bot, message.chat.id, message_id)
+                if await moderation.safe_delete(bot, message.chat.id, message_id):
+                    deleted += 1
         if chunk_start + 100 <= end:
             await asyncio.sleep(1.5)
 
     await notice(
         message,
-        "✅ پیام‌ها تا این نقطه با موفقیت پاکسازی شدند.",
+        f"✅ {deleted} پیام تا این نقطه با موفقیت پاکسازی شدند.",
         delay=5.0,
     )
-    log.info("WIPE by %s on %s from=%s to=%s", _actor(message), message.chat.id, start, end)
+    log.info("WIPE by %s on %s from=%s to=%s deleted=%s", _actor(message), message.chat.id, start, end, deleted)
 
 
 WIPE_ALL_DEPTH = 200
@@ -818,3 +869,109 @@ async def on_vip_command(message: Message, bot: Bot) -> None:
         delay=7.0,
     )
     log.info("VIP GRANT by %s on %s -> %s", actor.id, chat.id, target.id)
+
+
+# --------------------------------------------------------- hierarchical RBAC --
+def _parse_role_command(text: str | None) -> tuple[str, str] | None:
+    """Parse a promotion/demotion command like 'نصب معاون' or 'عزل معاون'.
+
+    Returns (command_text, target_role) or None.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    target_role = hierarchy.PROMOTE_ALIASES.get(raw)
+    if target_role is None:
+        return None
+    return raw, target_role
+
+
+async def _do_promote(
+    message: Message, bot: Bot, command_text: str, target_role: str
+) -> None:
+    """Promote/demote a replied-to user to a hierarchical role."""
+    chat_id = message.chat.id
+    actor = message.from_user
+    reply = message.reply_to_message
+    if actor is None or reply is None or chat_id is None:
+        return
+    target_user = reply.from_user
+    if target_user is None:
+        return
+
+    actor_role = await hierarchy.get_role(chat_id, actor.id)
+    if not hierarchy.can_appoint(actor_role, target_role):
+        await notice(
+            message,
+            "❌ شما مجوز نصب/عزل این مقام را ندارید.",
+            delay=7.0,
+        )
+        return
+
+    target_id = target_user.id
+
+    # Update Redis role
+    if target_role == hierarchy.Role.USER:
+        await hierarchy.remove_role(chat_id, target_id)
+    else:
+        await hierarchy.set_role(chat_id, target_id, target_role)
+
+    # Telegram permissions
+    perms = hierarchy.permissions_for(target_role)
+    try:
+        await bot.promote_chat_member(
+            chat_id=chat_id,
+            user_id=target_id,
+            can_change_info=perms.get("can_change_info", False),
+            can_delete_messages=perms.get("can_delete_messages", False),
+            can_invite_users=perms.get("can_invite_users", False),
+            can_restrict_members=perms.get("can_restrict_members", False),
+            can_pin_messages=perms.get("can_pin_messages", False),
+            can_promote_members=perms.get("can_promote_members", False),
+            can_manage_video_chats=perms.get("can_manage_video_chats", False),
+            can_manage_voice_chats=perms.get("can_manage_voice_chats", False),
+        )
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        log.warning("promote_chat_member failed: %s", exc)
+        await notice(message, "❌ نصب مقام در تلگرام انجام نشد.", delay=7.0)
+        return
+
+    # Custom title (no emojis, <= 16 chars)
+    title = hierarchy.custom_title(target_role)
+    if title:
+        try:
+            await bot.set_chat_administrator_custom_title(
+                chat_id=chat_id, user_id=target_id, custom_title=title
+            )
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            log.warning("set custom title failed: %s", exc)
+
+    await notice(
+        message,
+        "✅ کاربر به مقام منصوب شد و لقب دریافت کرد.",
+        delay=7.0,
+    )
+    log.info(
+        "ROLE PROMOTE by %s on %s -> %s in %s",
+        actor.id, target_id, target_role, chat_id,
+    )
+
+
+@router.message()
+async def on_role_command(message: Message, bot: Bot) -> None:
+    """Handle promotion/demotion commands (نصب/عزل معاون, ارشد چت, ...)."""
+    parsed = _parse_role_command(message.text)
+    if parsed is None:
+        return
+    chat_id = message.chat.id
+    actor = message.from_user
+    if actor is None or chat_id is None:
+        return
+
+    # Only staff can use these commands
+    actor_role = await hierarchy.get_role(chat_id, actor.id)
+    if hierarchy.level(actor_role) < hierarchy.level(hierarchy.Role.ADMIN_CALL):
+        return
+
+    command_text, target_role = parsed
+    await _do_promote(message, bot, command_text, target_role)

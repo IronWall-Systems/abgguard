@@ -33,9 +33,37 @@
 - Zero-disk retention: every archive is shipped to the God Admin's private chat as a document; wiped from local disk only after Telegram confirms upload. Failed uploads keep the file and notify the God Admin.
 - God Admin manual trigger: `rotate_now()` backs the PV button `[🟣 تخلیه دستی و فشرده‌سازی]` for on-demand ZIP rotation and delivery.
 
+- God Admin manual trigger: `rotate_now()` backs the PV button `[🟣 تخلیه دستی و فشرده‌سازی]` for on-demand ZIP rotation and delivery.
+
 ### 24-Hour Redis Escalating Strike System (`core/redis.py`, `master/handlers/guards.py`)
 - New `k_strike(chat_id, user_id)` key (`abg:strikes:{chat_id}:{user_id}`) with 86400s (24h) TTL.
 - On every profanity/NSFW violation: message is always deleted immediately, then the strike counter is incremented.
 - Escalating mute durations: Strikes 1-4 → delete only (no mute). Strike 5 → 5 min, Strike 6 → 10 min, Strike 7 → 30 min, Strike 8 → 1 hour, Strike 9+ → 24 hours.
 - Auto-deleting public warning (30s) shows strike count: `"⚠️ کاربر {mention}، پیام شما به دلیل محتوای نامناسب پاک شد. (اخطار {strike_count}/4)"` for strikes < 5, or `"🔇 کاربر {mention} به دلیل تکرار تخلف ({strike_count} بار) به مدت {duration_text} سکوت شد."` for strikes >= 5.
 - PV ModLog card includes `⚠️ تعداد تخلف امروز: {strike_count}` and `⚖️ اقدام ربات: {action_taken}`.
+
+## 2026-11-03 — Hierarchical RBAC, Uniform Titles & Dynamic Mute
+
+### Hierarchical RBAC (`core/hierarchy.py`, `core/redis.py`)
+- New `k_role(chat_id, user_id)` key (`abg:role:{chat_id}:{user_id}`) stored in Redis.
+- Role hierarchy: GOD (6) > DEPUTY (5) > SENIOR_CHAT/SENIOR_CALL (4) > ADMIN_CHAT/ADMIN_CALL (3) > USER (0).
+- Appointment rules: GOD appoints anyone; DEPUTY appoints Seniors/Admins; SENIOR_CHAT appoints Chat Admins; SENIOR_CALL appoints Call Admins.
+- `can_appoint(actor_role, target_role)` enforces hierarchy; `get_role()`/`set_role()`/`remove_role()` manage Redis storage.
+
+### Uniform Custom Titles (no emojis, <= 16 chars)
+- Deputy: `"معاون مالک"`; Senior Chat: `"ارشد چت"`; Senior Call: `"ارشد کال"`; Chat Admin: `"ادمین چت"`; Call Admin: `"ادمین کال"`.
+- `set_chat_administrator_custom_title()` called immediately after `promote_chat_member()`.
+
+### Promotion/Demotion Commands
+- `نصب معاون` / `عزل معاون`; `نصب ارشد چت` / `عزل ارشد چت`; `نصب ارشد کال` / `عزل ارشد کال`; `نصب ادمین چت` / `عزل ادمین چت`; `نصب ادمین کال` / `عزل ادمین کال`.
+- Executed by replying to target user; checks hierarchical authority before acting.
+- `promote_chat_member()` grants only role-appropriate permissions; custom title set immediately after.
+
+### Moderation Execution Validation
+- Ban (`بن` / `اخراج`): allowed ONLY for God, Deputy, Senior Chat, Senior Call.
+- Mute (`سکوت`): allowed ONLY for God, Deputy, Senior Chat, Chat Admin.
+
+### Dynamic Mute Command (`سکوت`)
+- Bare `سکوت` -> 30 minutes (1800s).
+- `سکوت X` (e.g., `سکوت 1`, `سکوت 5`) -> X hours (X * 3600s).
+- Uses `bot.restrict_chat_member(chat_id, user_id, until_date=time.time() + duration)`.
