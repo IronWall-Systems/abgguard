@@ -84,6 +84,50 @@ def k_user_vip(chat_id: int, user_id: int) -> str:
     return f"{GROUP}:{chat_id}:vip:{user_id}"
 
 
+# ---- SaaS subscription mirror + distributed heartbeat -----------------------
+SUB = f"{P}:sub"                             # + :{chat_id} -> hash(status, expires)
+HEARTBEAT_MASTER = f"{P}:heartbeat:master"   # TTL'd key, refreshed by the master
+PRESENCE = f"{P}:presence"                   # hash: chat_id -> 1 (bots inside)
+
+
+def k_sub_state(chat_id: int) -> str:
+    """abg:sub:{chat_id} -> hash mirror of the GroupSubscription row."""
+    return f"{SUB}:{chat_id}"
+
+
+async def heartbeat_master() -> None:
+    """Refresh the master liveness key (TTL 45s, refreshed every 15s)."""
+    await get_redis().set(HEARTBEAT_MASTER, "1", ex=settings.heartbeat_ttl)
+
+
+async def is_master_alive() -> bool:
+    try:
+        return bool(await get_redis().exists(HEARTBEAT_MASTER))
+    except Exception:
+        return True  # Redis unreachable: never take over blindly
+
+
+async def presence_add(chat_id: int) -> None:
+    try:
+        await get_redis().hset(PRESENCE, str(chat_id), "1")
+    except Exception:
+        pass
+
+
+async def presence_remove(chat_id: int) -> None:
+    try:
+        await get_redis().hdel(PRESENCE, str(chat_id))
+    except Exception:
+        pass
+
+
+async def presence_known() -> list[int]:
+    try:
+        return [int(cid) for cid in await get_redis().hkeys(PRESENCE)]
+    except Exception:
+        return []
+
+
 _client: aioredis.Redis | None = None
 
 

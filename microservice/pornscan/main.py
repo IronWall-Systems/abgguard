@@ -18,6 +18,13 @@ VIDEO_SAMPLE_FRAMES = int(os.getenv("PORNSCAN_VIDEO_FRAMES", "6"))
 
 # classes considered sexually explicit by NudeNet
 EXPLICIT_CLASSES = {
+    "ANUS_EXPOSED",
+    "BUTTOCKS_EXPOSED",
+    "FEMALE_BREAST_EXPOSED",
+    "FEMALE_GENITALIA_EXPOSED",
+    "MALE_BREAST_EXPOSED",
+    "MALE_GENITALIA_EXPOSED",
+    "FEMALE_GENITALIA_COVERED",
     "EXPOSED_ANUS",
     "EXPOSED_BREAST_FEMALE",
     "EXPOSED_BREAST_MALE",
@@ -27,7 +34,6 @@ EXPLICIT_CLASSES = {
     "COVERED_GENITALIA_FEMALE",
     "COVERED_GENITALIA_MALE",
     "MALE_BUTTOCKS",
-    "FEMALE_GENITALIA_COVERED",
 }
 
 app = FastAPI(title="ABG Guard - local nudity detector", version="1.0.0")
@@ -53,18 +59,16 @@ def get_detector():
     return _detector
 
 
-def _score_from_detections(dets: list[dict], threshold: float) -> tuple[float, list[str]]:
+def _score_from_detections(dets: list[dict]) -> tuple[float, list[str]]:
     labels: list[str] = []
     best = 0.0
     for det in dets:
         cls = str(det.get("class", "")).upper()
+        if cls not in EXPLICIT_CLASSES:
+            continue
         score = float(det.get("score", 0.0))
-        if cls in EXPLICIT_CLASSES:
-            labels.append(cls)
-            best = max(best, score)
-        elif score >= threshold and cls:
-            labels.append(cls)
-            best = max(best, score)
+        labels.append(cls)
+        best = max(best, score)
     return best, sorted(set(labels))
 
 
@@ -78,6 +82,8 @@ def _suffix(payload: bytes) -> str:
         return ".webp"
     if payload[:4] == b"GIF8":
         return ".gif"
+    if payload[:4] == b"\x1aE\xdf\xa3":
+        return ".webm"
     if len(payload) > 12 and payload[4:12] == b"ftyp":
         return ".mp4"
     return ".img"
@@ -97,13 +103,13 @@ def _temp_media(payload: bytes) -> Iterator[str]:
             pass
 
 
-def _detect_image(payload: bytes, threshold: float) -> tuple[float, list[str]]:
+def _detect_image(payload: bytes) -> tuple[float, list[str]]:
     kind, model = get_detector()
     # both backends read from a path (`cv2.imread` / ultralytics predictor)
     with _temp_media(payload) as path:
         if kind == "nudenet":
             dets = model.detect(path) or []
-            return _score_from_detections(dets, threshold)
+            return _score_from_detections(dets)
         results = model.predict(path, verbose=False, device=DEVICE)[0]
     names = results.names
     boxes = []
@@ -111,7 +117,7 @@ def _detect_image(payload: bytes, threshold: float) -> tuple[float, list[str]]:
         results.boxes.xyxy, results.boxes.cls, results.boxes.conf, strict=False
     ):
         boxes.append({"class": names[int(cls)], "score": float(conf), "box": box.tolist()})
-    return _score_from_detections(boxes, threshold)
+    return _score_from_detections(boxes)
 
 
 def _detect_video(payload: bytes, threshold: float) -> tuple[float, list[str]]:
@@ -122,7 +128,10 @@ def _detect_video(payload: bytes, threshold: float) -> tuple[float, list[str]]:
         log.warning("opencv not installed - video scanning disabled (fail-open)")
         return 0.0, []
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    suffix = _suffix(payload)
+    if suffix not in {".mp4", ".webm", ".gif"}:
+        suffix = ".mp4"
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     try:
         tmp.write(payload)
         tmp.close()
@@ -141,7 +150,7 @@ def _detect_video(payload: bytes, threshold: float) -> tuple[float, list[str]]:
             ok2, buf = cv2.imencode(".jpg", frame)
             if not ok2:
                 continue
-            score, found = _detect_image(buf.tobytes(), threshold)
+            score, found = _detect_image(buf.tobytes())
             if score > best:
                 best = score
             labels.extend(found)
@@ -189,7 +198,7 @@ async def detect(
         ):
             score, labels = _detect_video(payload, threshold)
         else:
-            score, labels = _detect_image(payload, threshold)
+            score, labels = _detect_image(payload)
     except Exception as exc:
         log.exception("scan failed")
         # fail-open so a detector crash never freezes the worker bot

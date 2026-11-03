@@ -12,10 +12,11 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiohttp import web
 
 from abgguard.config import settings
-from abgguard.core import rbac
+from abgguard.core import botpair, rbac
 from abgguard.core.db import close_db, init_db
 from abgguard.core.redis import close_redis
 from abgguard.master.bot import create_master
+from abgguard.services import modlog, scheduler
 from abgguard.services.antiporn import porn_client
 from abgguard.services.bus import BanEventBus
 from abgguard.services.harvester import harvester
@@ -33,6 +34,7 @@ PV_UPDATE_TYPES: tuple[str, ...] = ("callback_query", "message")
 def allowed_updates(dp: Dispatcher, *, require_pv: bool = False) -> list[str]:
     """Explicit, non-empty allowed_updates list for polling / webhook."""
     used = set(dp.resolve_used_update_types())
+    used.add("message")
     if require_pv:
         used.update(PV_UPDATE_TYPES)
     return sorted(used)
@@ -201,9 +203,11 @@ async def main() -> None:
     await init_db()
     await rbac.bootstrap()
     await harvester.start()
+    await botpair.init()  # resolve @ABGGUARD1BOT id/username for onboarding
 
     bot_master, dp_master = create_master(settings.master_token)
     bot_worker, dp_worker = create_worker(settings.worker_token)
+    modlog.bind_master_bot(bot_master)
 
     me = await bot_master.me()
     worker_me = await bot_worker.me()
@@ -223,6 +227,7 @@ async def main() -> None:
 
     bus = BanEventBus(bot_master, me.id)
     await bus.start()
+    scheduler.start(bot_master)  # heartbeat (15s) + warnings/expiry/audit (4h)
 
     runner: Callable[[], Awaitable[None]] = (
         _run_webhook if settings.run_mode == "webhook" else _run_polling
@@ -232,6 +237,7 @@ async def main() -> None:
         await runner(bot_master, dp_master, bot_worker, dp_worker)
     finally:
         log.info("shutting down services")
+        await scheduler.stop()
         await bus.stop()
         await harvester.stop()
         await porn_client.close()

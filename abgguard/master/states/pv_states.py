@@ -17,6 +17,12 @@ class PvGodSG(StatesGroup):
 
     broadcast = State()    # free text -> fan-out to every managed group
 
+    # payment gateway management (card / crypto, God Admin only):
+    #   pay_title -> display title  ("بانک ملت" / "Tether TRC20")
+    #   pay_value -> card number    / wallet address
+    pay_title = State()
+    pay_value = State()
+
 
 class PvAdminSG(StatesGroup):
     """Level 2/1 prompts - configured per selected group, never in the group."""

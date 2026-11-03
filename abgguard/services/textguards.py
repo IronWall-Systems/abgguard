@@ -161,6 +161,168 @@ def normalize(text: str) -> str:
     return _WS.sub(" ", folded).strip().casefold()
 
 
+# --------------------------------------------------------------------------
+# Advanced anti-obfuscation floor
+# --------------------------------------------------------------------------
+# A second, deliberately aggressive pass.  It is independent of the admin
+# blacklist: the roots below are always active, so spaced / dotted / ZWNJ /
+# repeated-character smuggling can never hide them.
+BAD_WORDS_ROOTS: set[str] = {
+    # Base Organs & Slang
+    "کیر", "کون", "خایه", "شاش", "گوه", "گه", "چوچول", "جق",
+    "کیرم", "کیرت", "کیرش", "کیری", "کسش", "کصش",
+    "کونم", "کونت", "کونش", "خایم", "خایت", "خایش",
+
+    # Direct Insults & Slurs
+    "جنده", "قحبه", "قهبه", "کسکش", "کصکش", "کونی", "دیوث", "دایوس", "پفیوز", "لاشی",
+    "حرومزاده", "حرامزاده", "ابنه", "اوبی", "سلیطه", "پتیاره", "لکاته", "بیناموس", "تخمسگ",
+    "پدرسگ", "توله‌سگ", "تولهسگ", "کفتار", "شاشو",
+
+    # Family Combinations (Mother, Sister, Aunt, Wife, etc.)
+    "مادرجنده", "مادرسگ", "مادرکسه", "مادرکصده", "مادرکسده", "مادرخراب", "مادرقحبه", "مادرقهبه", "مادرکص",
+    "ننهجنده", "ننهکسه", "ننهکصده", "ننهخراب", "ننهقحبه", "ننهکس",
+    "خواهرجنده", "خواهرکسه", "خواهرکصده", "خواهرخراب", "خواهرکس",
+    "خارکسه", "خارکصده", "خارجنده", "خارخراب", "خارکس",
+    "خوارکسه", "خوارکصده", "خوارجنده", "خوارخراب", "خوارقحبه", "خوارکس",
+    "عمهجنده", "عمهکسه", "عمهخراب", "عمهکصده",
+    "زنجنده", "زنقحبه", "زنسلیطه",
+
+    # Cognitive / Compound Insults
+    "کسخل", "کصخل", "کسمغز", "کصمغز", "کسشر", "کصشر", "کصشعر", "کسشعر", "کسده", "کصده",
+    "کسلیس", "کصلیس", "کیرلیس", "کونلیس", "خایمال", "خایهمال", "گهخور", "گوهخور", "شاشخور",
+    "کسپاره", "کصپاره", "کونپاره",
+
+    # Action / Vulgar Verbs
+    "گاییدم", "گایید", "میگام", "میگایم", "بگا", "بگام", "بگیم", "میگامت", "گاییده",
+    "ساکزن", "جقی", "جقزن", "حشری", "سکس", "پورن",
+    "تلمبه", "صیغه", "کیرمتو", "بیاخور",
+
+    # Variations & Typo Catchers
+    "ک30", "ک3", "کصکشا", "کونیا", "جندها", "کیریا", "لاشیها", "لاشیا",
+}
+
+# Exact severe phrases - the regex builder's \W* handles any spaces/dots
+# between letters, so "کیرم تو کس" also matches "کیرم.تو.کس" etc.
+BAD_PHRASES: set[str] = {
+    "کیرم تو کس", "کیرم تو کص", "کیرم دهنت", "کیرم تو دهنت", "کیرم تو حلق",
+    "کس مادرت", "کص مادرت", "کس ننت", "کص ننت", "کس خارت", "کص خارت",
+    "کس خواهرت", "تخم سگ", "تخم جن", "تخم حروم", "ساک بزن", "بیا بخور",
+}
+
+# Proximity matching: catch ambiguous words ONLY when they appear near
+# target words (e.g., "کس" within 15 chars of "مادر"), handling all
+# spacing/noise in between via .{0,15}.
+CONTEXT_PATTERNS: list[str] = [
+    r"(کس|کص|قس|ممه).{0,15}(مادر|ننه|خار|خواهر|خوار|عمه|زن|عشقت)",
+    r"(مادر|ننه|خار|خواهر|خوار|عمه|زن|عشقت).{0,15}(کس|کص|قس|جنده|خراب|سگ|قهبه)",
+    r"(تخم).{0,15}(سگ|جن|حروم|حرام|سایه)",
+    r"(کیرم|کیر).{0,15}(دهنت|کس|کص|کون|حلق|تو|مادر|ننه|خار|خواهر)",
+]
+COMPILED_CONTEXT: list[re.Pattern] = [re.compile(p, re.IGNORECASE) for p in CONTEXT_PATTERNS]
+
+# Arabic -> Persian + alef variants for the aggressive pass.
+_ADV_FOLD = str.maketrans({
+    "\u064a": "\u06cc",  # ي -> ی
+    "\u0649": "\u06cc",  # ى -> ی
+    "\u0643": "\u06a9",  # ك -> ک
+    "\u0629": "\u0647",  # ة -> ه
+    "\u0623": "\u0627",  # أ -> ا
+    "\u0625": "\u0627",  # إ -> ا
+    "\u0671": "\u0627",  # ٱ -> ا
+    "\u0624": "\u0648",  # ؤ -> و
+})
+
+# Every separator / symbol an offender can inject between letters.
+_ADV_NOISE = re.compile(
+    r"[\s\u200c\u200d\u2060\ufeff\u00ad\u0640"
+    r".\-_*,،;؛:!?؟'\"`´()\[\]{}<>/\\|+=~@#%&…·•]+"
+)
+_REPEATS = re.compile(r"(.)\1+")
+
+
+def normalize_text(text: str) -> str:
+    """Aggressive canonical form for the advanced floor.
+
+    Arabic letters are folded to Persian, diacritics / tatweel / zero-width
+    characters are dropped, every space / dot / dash / punctuation noise is
+    removed, and runs of one character collapse to a single one.  ``ک ی ر``,
+    ``ک.ی.ر``, ``ک‌ون`` and ``کوووون`` therefore all become ``کیر`` / ``کون``.
+    """
+    if not text:
+        return ""
+    folded = str(text).translate(_ADV_FOLD)
+    folded = _DIACRITICS.sub("", folded)
+    folded = folded.translate(_COMBINING)
+    folded = _ADV_NOISE.sub("", folded)
+    folded = _REPEATS.sub(r"\1", folded)
+    return folded.casefold()
+
+
+# Words that are also ordinary Persian (کس = person, تخم = egg, کردن = to do,
+# دادن = to give, ...).  They only fire when the whole message is the word
+# itself; otherwise a normal sentence would be muted.  Any real compound
+# (کسکش، تخمسگ، کیر کردن) is still caught by its own explicit root.
+_CONTEXT_REQUIRED = frozenset({
+    "کس", "قس", "گه", "تخم", "ساک", "بکن", "کردن", "کردم", "دادن", "دادم",
+    "میدم", "تلمبه", "حامله", "صیغه",
+})
+
+def _build_profanity_regex(bad_words: set[str]) -> re.Pattern:
+    """Build a single compiled regex that matches any bad word with word
+    boundaries, allowing optional non-word separators and repeated chars
+    between letters.  Keeps CPU/RAM minimal - one pass over the text."""
+    patterns = []
+    for word in bad_words:
+        # For each letter, require at least one occurrence (+),
+        # separated by optional non-word characters (\W*) like spaces, dots, ZWNJ.
+        pattern_body = r"\W*".join(re.escape(char) + r"+" for char in word)
+        # Lookbehind/lookahead enforce word boundaries so ``عکس`` does not
+        # match ``کس`` and ``تخمه`` does not match ``تخم``.
+        patterns.append(rf"(?<!\w){pattern_body}(?!\w)")
+
+    combined = "|".join(patterns)
+    return re.compile(combined, re.IGNORECASE)
+
+
+PROFANITY_REGEX = _build_profanity_regex(BAD_WORDS_ROOTS | BAD_PHRASES)
+
+
+def find_badword_root(text: str) -> str | None:
+    r"""Return the matched bad-word substring that fires on ``text``, else
+    ``None``.
+
+    Uses a compiled regex with word boundaries so innocent words like
+    ``عکس`` (picture) and ``تخمه`` (seed) do not trigger ``کس`` / ``تخم``.
+    Spaces and punctuation are kept so the ``\w`` / ``\W`` boundaries work.
+    Checks single-word roots and exact severe phrases via PROFANITY_REGEX,
+    then falls back to contextual proximity patterns (COMPILED_CONTEXT) so
+    ambiguous words only fire near target words.
+    """
+    if not text:
+        return None
+
+    # Fold characters and remove diacritics/tatweel, but KEEP spaces/punctuation
+    # so the Regex word boundaries (\w and \W) function correctly.
+    folded = str(text).translate(_ADV_FOLD)
+    folded = _DIACRITICS.sub("", folded)
+    folded = folded.translate(_COMBINING)
+    folded = folded.replace("\u200c", " ").replace("ـ", "")
+    folded = folded.casefold()
+
+    # 1. Single-word roots and exact severe phrases via the compiled regex
+    match = PROFANITY_REGEX.search(folded)
+    if match:
+        return match.group(0)
+
+    # 2. Contextual proximity - ambiguous words only near target words
+    for pattern in COMPILED_CONTEXT:
+        match = pattern.search(folded)
+        if match:
+            return match.group(0)
+
+    return None
+
+
 def _canonical(word: str) -> str:
     """Letters and digits only - separators come back as _GLUE in the pattern."""
     return "".join(ch for ch in normalize(word) if ch.isalnum())

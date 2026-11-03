@@ -271,6 +271,7 @@ async def _mute(
     seconds: int,
     reason: str,
     actor_source: str | None = None,
+    **kwargs,
 ):
     REC.mutes.append((chat_id, user_id, seconds))
     REC.sources.append(actor_source)
@@ -286,6 +287,7 @@ async def _ban(
     reason: str,
     notify=None,
     actor_source: str | None = None,
+    **kwargs,
 ):
     REC.bans.append((chat_id, user_id, reason))
     REC.sources.append(actor_source)
@@ -352,10 +354,13 @@ def test_obfuscated_severe_word_is_still_caught(master, monkeypatch) -> None:
 
 def test_mild_gslang_passes_and_reaches_the_dataset(master, monkeypatch) -> None:
     _install(monkeypatch)
-    _feed(master, "اسکل و دلقک و گوه و پشمام")
+    # گوه / کصشعر are now part of the advanced floor, so they are not in the
+    # "still legal" sample any more.
+    text = "اسکل و دلقک و تخمی و پشمام"
+    _feed(master, text)
 
     assert REC.deleted == []
     assert REC.dirty == []
     assert REC.strikes == []
     assert REC.mutes == []
-    assert REC.harvested == ["اسکل و دلقک و گوه و پشمام"]
+    assert REC.harvested == [text]

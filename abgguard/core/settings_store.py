@@ -3,9 +3,14 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from abgguard.config import settings
 from abgguard.core import redis as rk
-from abgguard.models.entities import BadWord, GroupPolicy, GroupSettings
-from abgguard.services.textguards import DEFAULT_FIGHT_WORDS, find_fight_word
+from abgguard.models.entities import BadWord, GroupPolicy, GroupSettings, PaymentMethod
+from abgguard.services.textguards import (
+    DEFAULT_FIGHT_WORDS,
+    find_badword_root,
+    find_fight_word,
+)
 
 log = logging.getLogger("abgguard.settings")
 
@@ -193,13 +198,19 @@ async def load_badwords_refresh(chat_id: int) -> None:
 
 async def contains_badword(chat_id: int, text: str) -> str | None:
     """Anti-bypass probe: normalised, word-boundary aware match that returns
-    the blacklist entry which fired (for the strike notice)."""
+    the blacklist entry which fired (for the strike notice).
+
+    The admin-managed list is checked first (it keeps its lookalike-safe
+    boundaries); the always-on advanced floor then catches spaced, dotted,
+    ZWNJ-separated and repeated-character obfuscation.
+    """
     if not text:
         return None
     words = await load_badwords(chat_id)
-    if not words:
-        return None
-    return find_fight_word(text, words)
+    hit = find_fight_word(text, words) if words else None
+    if hit is not None:
+        return hit
+    return find_badword_root(text)
 
 
 # --------------------------------------------------------------------------
@@ -250,3 +261,64 @@ async def set_welcome(chat_id: int, text: str | None) -> None:
     row.welcome_text = text
     await row.save(update_fields=["welcome_text"])
     await rk.get_redis().hset(rk.k_policy(chat_id), mapping={"welcome": text or ""})
+
+
+# ---------------------------------------------------------------- payment ---
+# God-managed payment gateways (card numbers / USDT wallets). When the table
+# is still empty the config env values are served as built-in defaults so the
+# payment screen is never blank.
+async def payment_list(active_only: bool = True) -> list[PaymentMethod]:
+    """Active gateways; falls back to the env-configured defaults."""
+    q = PaymentMethod.all()
+    if active_only:
+        q = q.filter(is_active=True)
+    rows = list(await q)
+    if rows:
+        return rows
+    fallback: list[PaymentMethod] = []
+    if settings.payment_card_number:
+        fallback.append(
+            PaymentMethod(
+                id=0,
+                type=PaymentMethod.CARD,
+                title=settings.payment_card_holder[:64] or "کارت بانکی",
+                value=settings.payment_card_number,
+            )
+        )
+    if settings.payment_crypto_address:
+        fallback.append(
+            PaymentMethod(
+                id=0,
+                type=PaymentMethod.CRYPTO,
+                title="Tether TRC20",
+                value=settings.payment_crypto_address,
+            )
+        )
+    return fallback
+
+
+async def payment_add(ptype: str, title: str, value: str) -> PaymentMethod:
+    """Create a gateway; only the first non-empty active row matters to users."""
+    row = await PaymentMethod.create(type=ptype[:8], title=title[:64], value=value[:128])
+    if not row.is_active:  # defensive; created rows are active by default
+        row.is_active = True
+    return row
+
+
+async def payment_toggle(pid: int) -> bool:
+    """Deactivate/activate a gateway in one click. Returns the new state."""
+    row = await PaymentMethod.get_or_none(id=pid)
+    if row is None:
+        return False
+    row.is_active = not row.is_active
+    await row.save(update_fields=["is_active"])
+    return row.is_active
+
+
+async def payment_delete(pid: int) -> bool:
+    """Remove a gateway permanently (God Admin cleanup)."""
+    row = await PaymentMethod.get_or_none(id=pid)
+    if row is None:
+        return False
+    await row.delete()
+    return True

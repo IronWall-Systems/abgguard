@@ -16,15 +16,30 @@ from aiogram.types import (
 )
 
 from abgguard.config import settings
-from abgguard.core import rbac, settings_store
+from abgguard.core import botpair, rbac, settings_store
+from abgguard.core import groups as groups_store
 from abgguard.core import redis as rk
 from abgguard.core.rbac import Role
-from abgguard.services import antiflood
+from abgguard.master import ui
+from abgguard.models.entities import GroupSubscription
+from abgguard.services import antiflood, subscription
 from abgguard.services.moderation import NO_SEND, temp_mute_chat
 
 log = logging.getLogger("abgguard.master.members")
 
 router = Router(name="master.members")
+
+_ME_ID: int | None = None
+
+
+async def _master_id(bot: Bot) -> int:
+    global _ME_ID
+    if _ME_ID is None:
+        try:
+            _ME_ID = (await bot.me()).id
+        except Exception:
+            _ME_ID = 0
+    return _ME_ID
 
 _JOINING = {
     ChatMemberStatus.MEMBER,
@@ -155,6 +170,280 @@ async def on_left_member(message: Message) -> None:
         await message.delete()
     except Exception:
         pass
+
+
+# ================================================ SaaS onboarding (my_chat_member) ==
+async def _dual_bot_state(bot: Bot, chat_id: int) -> tuple[bool, bool]:
+    """(present, is_admin) for @ABGGUARD1BOT inside this chat."""
+    present = await botpair.worker_present(chat_id)
+    is_admin = present and await botpair.worker_is_admin(chat_id)
+    return present, is_admin
+
+
+async def _send_card(bot: Bot, chat_id: int, text: str, kb=None) -> None:
+    try:
+        await bot.send_message(chat_id, text, reply_markup=kb)
+    except Exception:
+        log.debug("subscription card failed chat=%s", chat_id, exc_info=True)
+
+
+async def _is_telegram_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+    except Exception:
+        return False
+    if getattr(member.user, "is_bot", False):
+        return False
+    return member.status in (ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR)
+
+
+async def _resolve_group_admin(bot: Bot, event: ChatMemberUpdated) -> int | None:
+    """Adding actor first; otherwise the group creator/first human admin."""
+    adder = event.from_user
+    if (
+        adder is not None
+        and not adder.is_bot
+        and await _is_telegram_admin(bot, event.chat.id, adder.id)
+    ):
+        return adder.id
+
+    try:
+        admins = await bot.get_chat_administrators(event.chat.id)
+    except Exception:
+        return None
+    creator: int | None = None
+    fallback: int | None = None
+    for member in admins:
+        user = member.user
+        if user.is_bot:
+            continue
+        if member.status == ChatMemberStatus.CREATOR:
+            creator = user.id
+        elif fallback is None:
+            fallback = user.id
+    return creator or fallback
+
+
+async def _auto_bind_owner(bot: Bot, event: ChatMemberUpdated) -> None:
+    """First admin who adds the bot becomes Level 2 owner (unless one exists)."""
+    chat_id = event.chat.id
+    if await rbac.list_owner_ids(chat_id):
+        return
+    user_id = await _resolve_group_admin(bot, event)
+    if user_id is None or await rbac.is_god(user_id):
+        return
+    try:
+        await rbac.add_admin(chat_id, user_id, granted_by=settings.god_admin_id)
+    except Exception:
+        log.warning("auto owner bind failed chat=%s user=%s", chat_id, user_id, exc_info=True)
+        return
+    log.info("AUTO OWNER bound: chat=%s user=%s", chat_id, user_id)
+
+
+async def _onboard(bot: Bot, chat_id: int, title: str | None) -> None:
+    """Spec §2: trial for 50+ members, payment card otherwise."""
+    row = await subscription.record_join(chat_id, title)
+
+    # whitelisted / paid groups stay COMPLETELY silent on (re)join: no
+    # subscription card, no pricing, no tutorial - ever (fix directive #2)
+    if row.status in (GroupSubscription.MANUAL_WHITELIST, GroupSubscription.ACTIVE):
+        return
+
+    present, is_admin = await _dual_bot_state(bot, chat_id)
+    try:
+        count = await bot.get_chat_member_count(chat_id)
+    except Exception:
+        count = 0
+
+    if count >= subscription.TRIAL_MIN_MEMBERS and not row.trial_used:
+        await subscription.activate_trial(chat_id)
+        _spawn(
+            _send_card(
+                bot,
+                chat_id,
+                ui.trial_activated(
+                    chat_id, title or str(chat_id),
+                    subscription.TRIAL_HOURS, present, is_admin,
+                ),
+                ui.onboarding_kb(chat_id),
+            ),
+            name=f"onboard-trial:{chat_id}",
+        )
+        return
+
+    text, kb = ui.subscription_required(
+        chat_id, title or str(chat_id), count, present, is_admin
+    )
+    _spawn(_send_card(bot, chat_id, text, kb), name=f"onboard-unpaid:{chat_id}")
+
+
+@router.my_chat_member()
+async def on_master_membership(event: ChatMemberUpdated, bot: Bot) -> None:
+    """The master itself was added / kicked - drives the whole SaaS lifecycle."""
+    chat = event.chat
+    if chat.type not in {"group", "supergroup"}:
+        return
+    me_id = await _master_id(bot)
+    if event.new_chat_member.user.id != me_id:
+        return  # other members join/leave via the chat_member path
+
+    if event.new_chat_member.status in _JOINING:
+        title = getattr(chat, "title", None)
+        await groups_store.upsert_group(chat.id, title=title, username=chat.username)
+        await rk.presence_add(chat.id)
+        await _auto_bind_owner(bot, event)
+        await _onboard(bot, chat.id, title)
+        return
+
+    if event.new_chat_member.status in _LEFT:
+        await rk.presence_remove(chat.id)
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.text.func(lambda t: t and t.split(maxsplit=1)[0].split("@", 1)[0] == "/sub"),
+)
+async def on_sub_command(message: Message, bot: Bot) -> None:
+    """/sub in the group -> the current subscription status card + tutorial."""
+    chat_id = message.chat.id
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    row = await subscription.record_join(chat_id, message.chat.title)
+    if not await subscription.is_active(chat_id):
+        await subscription.send_expiry_notice(bot, chat_id)
+        return
+
+    present, is_admin = await _dual_bot_state(bot, chat_id)
+    status = GroupSubscription.ACTIVE
+    exp = row.expires_at
+    text = ui.active_state_text(
+        chat_id, message.chat.title or str(chat_id), status, exp, present, is_admin
+    )
+    kb = ui.subscribe_kb(chat_id, paid=ui.is_premium(status, exp))
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("sub:"))
+async def on_sub_callback(cq: CallbackQuery, bot: Bot) -> None:
+    """Renewal/status refresh, works in the group AND in the bot's PV."""
+    parts = (cq.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    if action in {"approve", "reject"} and len(parts) == 4:
+        await _god_receipt_decision(cq, bot, action, int(parts[2]), int(parts[3]))
+        return
+    if len(parts) < 3 or action not in {"menu", "pay", "receipt"}:
+        await cq.answer()
+        return
+    try:
+        chat_id = int(parts[2])
+    except ValueError:
+        await cq.answer()
+        return
+    if cq.message is None or cq.message.chat is None:
+        await cq.answer()
+        return
+
+    row = await subscription.record_join(chat_id)
+    active = await subscription.is_active(chat_id)
+    title = row.title or str(chat_id)
+    if action == "pay":
+        # dedicated payment screen - works in groups AND in the bot's PV
+        await cq.message.answer(
+            ui.pay_screen_text(chat_id, title, row.status, row.expires_at),
+            reply_markup=await ui.pay_screen_kb(chat_id),
+        )
+        await cq.answer()
+        return
+    if action == "receipt":
+        # in-bot receipt workflow: open a 15-minute submission window
+        await rk.get_redis().set(
+            f"{rk.P}:receipt_wait:{cq.from_user.id}", str(chat_id), ex=900
+        )
+        if cq.message.chat.type == "private":
+            where = "همین‌جا در چت ربات"
+        else:
+            where = f"در چت خصوصی ربات @{settings.master_username}"
+        await cq.message.answer(
+            f"📩 لطفاً فیش پرداخت (عکس، فایل یا متن تراکنش) را {where} "
+            "بفرستید.\n⏳ ۱۵ دقیقه فرصت دارید."
+        )
+        await cq.answer()
+        return
+    if not active:
+        past, is_admin = (False, False)
+        if cq.message.chat.type != "private":
+            past, is_admin = await _dual_bot_state(bot, chat_id)
+        text, kb = ui.subscription_required(chat_id, title, 0, past, is_admin)
+    else:
+        text = ui.pay_view_text(chat_id, title, GroupSubscription.ACTIVE, row.expires_at)
+        kb = ui.subscribe_kb(chat_id, paid=True)
+
+    try:
+        await cq.message.answer(text, reply_markup=kb)
+    except Exception:
+        log.debug("sub card send failed chat=%s", chat_id, exc_info=True)
+    await cq.answer()
+
+
+async def _god_receipt_decision(
+    cq: CallbackQuery, bot: Bot, action: str, chat_id: int, user_id: int
+) -> None:
+    """One-click receipt approval for the God Admin (directive 2)."""
+    god = cq.from_user
+    if god is None or not await rbac.is_god(god.id):
+        await cq.answer("⛔️ فقط مدیریت کل (God Admin) می‌تواند فیش را تصویب کند.", show_alert=True)
+        return
+    titles = await groups_store.known_titles([chat_id])
+    title = titles.get(chat_id, str(chat_id))
+    if action == "approve":
+        row = await subscription.activate_paid(chat_id)
+        try:
+            await cq.message.edit_text(
+                f"✅ پرداخت تایید شد\n🏘 گروه: <b>{title}</b>\n"
+                f"🆔 <code>{chat_id}</code>\n"
+                f"📅 وضعیت: {ui.status_line(row.status, row.expires_at)}\n"
+                f"👤 کاربر: <code>{user_id}</code>"
+            )
+        except Exception as exc:
+            log.debug("god approve card edit failed: %s", exc)
+        await cq.answer("اشتراک فعال شد ✅")
+        try:
+            await bot.send_message(
+                user_id,
+                f"✅ پرداخت شما تایید شد و اشتراک ۳۰ روزه گروه از این پس فعال است.\n"
+                f"🏘 گروه: <b>{title}</b>",
+            )
+        except Exception:
+            log.debug("payer DM failed chat=%s user=%s", chat_id, user_id, exc_info=True)
+        try:
+            await bot.send_message(
+                chat_id,
+                "🎉 پرداخت شما تایید شد و اشتراک گروه به مدت ۳۰ روز با موفقیت فعال گردید.",
+            )
+        except Exception:
+            log.debug("group receipt notice failed chat=%s", chat_id, exc_info=True)
+        log.warning("RECEIPT APPROVED chat=%s user=%s by=%s", chat_id, user_id, god.id)
+        return
+    try:
+        await cq.message.edit_text(
+            f"❌ فیش رد شد\n🏘 گروه: <b>{title}</b>\n"
+            f"🆔 <code>{chat_id}</code>\n👤 کاربر: <code>{user_id}</code>"
+        )
+    except Exception as exc:
+        log.debug("god reject card edit failed: %s", exc)
+    await cq.answer("فیش رد شد")
+    try:
+        await bot.send_message(
+            user_id,
+            "❌ فیش پرداخت شما رد شد. جهت بررسی بیشتر با پشتیبانی (@pyyple) "
+            "در ارتباط باشید.",
+        )
+    except Exception:
+        log.debug("reject DM failed user=%s", user_id, exc_info=True)
+    log.warning("RECEIPT REJECTED chat=%s user=%s by=%s", chat_id, user_id, god.id)
 
 
 # ================================================ welcome + anti-bot CAPTCHA ==

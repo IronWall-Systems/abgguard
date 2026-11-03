@@ -6,22 +6,23 @@ import logging
 from datetime import UTC, datetime
 
 from aiogram import Bot, F, Router
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command, Filter, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, ChatPermissions, InlineKeyboardButton, Message
 
 from abgguard.config import settings
+from abgguard.core import botpair, rbac, settings_store
 from abgguard.core import groups as groups_store
-from abgguard.core import rbac, settings_store
 from abgguard.core import redis as rk
 from abgguard.core import trigger as trigger_store
 from abgguard.core.rbac import Role
 from abgguard.master import pv_keyboards as kb
+from abgguard.master import ui
 from abgguard.master.ephemeral import fa_num
 from abgguard.master.handlers.help import render_menu
 from abgguard.master.states.pv_states import PvAdminSG, PvGodSG
-from abgguard.models.entities import BanLog
-from abgguard.services import metrics
+from abgguard.models.entities import BanLog, GroupSubscription
+from abgguard.services import metrics, subscription
 from abgguard.services.antiporn import porn_client
 from abgguard.services.harvester import harvester
 
@@ -33,6 +34,9 @@ fsm_router = Router(name="master.pv-fsm")
 router = Router(name="master.pv")
 
 TRIGGER = "پنل"
+
+# step 2: strict RBAC - the dashboard belongs to registered staff only
+RBAC_REJECT = "⛔️ فقط ادمین‌ها و ساب‌ادمین‌های ثبت‌شده به پنل دسترسی دارند."
 
 # fire-and-forget jobs (strong refs so they are never garbage collected)
 _background: set[asyncio.Task] = set()
@@ -249,23 +253,69 @@ async def _ai_text(note: str | None = None) -> str:
 
 
 async def _owners_rows() -> list[tuple[int, int, str]]:
-    bindings = await rbac.list_owner_bindings()
-    titles = await groups_store.known_titles([c for c, _ in bindings])
-    return [
-        (chat_id, user_id, titles.get(chat_id, str(chat_id)))
-        for chat_id, user_id in bindings
-    ]
+    """One row per tracked group: (chat_id, owner_id, title).
+
+    The list is built from the unified roster (Group + RoleBinding +
+    GroupSubscription), so whitelisted groups can never disappear from the
+    God panel just because their owner binding was created through another
+    path.
+    """
+    chat_ids = sorted(await groups_store.managed_chat_ids())
+    if not chat_ids:
+        return []
+    titles = await groups_store.known_titles(chat_ids)
+    god = int(settings.god_admin_id)
+    owners: dict[int, list[int]] = {}
+    for chat_id, user_id in await rbac.list_owner_bindings():
+        owners.setdefault(chat_id, []).append(user_id)
+    rows: list[tuple[int, int, str]] = []
+    for chat_id in chat_ids:
+        specific = [u for u in owners.get(chat_id, []) if u != god]
+        owner = specific[0] if specific else god
+        rows.append((chat_id, owner, titles.get(chat_id, str(chat_id))))
+    return rows
+
+
+def _payment_methods_text(methods: list) -> str:
+    lines = ["⚙️ مدیریت حساب‌ها و درگاه پرداخت", f"تعداد: {len(methods)}", ""]
+    for m in methods[:20]:
+        mark = "🟢 فعال" if m.is_active else "⚪️ غیرفعال"
+        kind = "💳 کارت" if m.type == "card" else "🪙 ولت"
+        lines.append(f"• {mark} | {kind} | {html.escape(m.title)}\n  <code>{html.escape(m.value)}</code>")
+    if not methods:
+        lines.append("هیچ روشی ثبت نشده؛ مقادیر پیش‌فرض از .env استفاده می‌شود.")
+    lines += ["", "👆 روی هر مورد بزنید تا فعال/غیرفعال شود؛ 🗑 حذف می‌کند."]
+    return "\n".join(lines)
 
 
 async def _owners_text(note: str | None = None) -> str:
     rows = await _owners_rows()
+    for chat_id, _owner, title in rows:
+        await subscription.record_join(chat_id, title)
+    chat_ids = [chat_id for chat_id, _owner, _title in rows]
+    subs = {
+        int(chat_id): (status, expires)
+        for chat_id, status, expires in await GroupSubscription.filter(
+            chat_id__in=chat_ids
+        ).values_list("chat_id", "status", "expires_at")
+    } if chat_ids else {}
     lines = ["👥 مدیران کل گروه‌ها (Level 2)", f"تعداد: {len(rows)}", ""]
     for chat_id, user_id, title in rows[:20]:
+        status, expires = subs.get(
+            chat_id, (GroupSubscription.UNPAID, None)
+        )
+        owner = (
+            "God Admin"
+            if int(user_id) == int(settings.god_admin_id)
+            else f"کاربر <code>{user_id}</code>"
+        )
         lines.append(
-            f"• {_esc(title)} → کاربر <code>{user_id}</code> | گروه <code>{chat_id}</code>"
+            f"• <b>{_esc(title)}</b>\n"
+            f"  🆔 <code>{chat_id}</code> | 👑 {owner}\n"
+            f"  📅 {ui.status_line(status, expires)}"
         )
     if not rows:
-        lines.append("هنوز مدیر گروهی ثبت نشده است.")
+        lines.append("هنوز گروهی ثبت نشده است.")
     if note:
         lines += ["", f"✅ {note}"]
     lines += ["", f"🕐 {_now()}", "", "برای جزئیات، روی مورد نظر بزنید."]
@@ -362,11 +412,144 @@ async def _root_parts(bot: Bot, user, state: FSMContext) -> tuple[str, object]:
 
 
 # ------------------------------------------------------------- entry points --
+# ------------------------------------------------------ in-bot receipt flow --
+class ReceiptWait(Filter):
+    """True only while this user has an open `sub:receipt` submission window.
+
+    Kept as a filter (not a router-level switch) so ordinary PV traffic -
+    /start, «پنل», FSM steps - flows exactly as before.
+    """
+
+    async def __call__(self, message: Message) -> bool:
+        user = message.from_user
+        if user is None:
+            return False
+        try:
+            return bool(await rk.get_redis().get(f"{rk.P}:receipt_wait:{user.id}"))
+        except Exception:
+            return False
+
+
+@router.message(F.chat.type == "private", ReceiptWait())
+async def on_receipt_sent(message: Message, bot: Bot) -> None:
+    """The receipt itself (photo/document/transaction text) - straight to God.
+
+    The source message is copied verbatim to the God Admin's PV with one-click
+    ✅/❌ buttons; nothing ever leaves the bot (directive 2).
+    """
+    user = message.from_user
+    if user is None:
+        return
+    raw = await rk.get_redis().get(f"{rk.P}:receipt_wait:{user.id}")
+    if not raw:
+        return
+    chat_id = int(raw)
+    await rk.get_redis().delete(f"{rk.P}:receipt_wait:{user.id}")
+    titles = await groups_store.known_titles([chat_id])
+    title = titles.get(chat_id, str(chat_id))
+    uname = f"@{user.username}" if user.username else str(user.id)
+    await message.answer(
+        "✅ فیش شما ثبت و برای مدیریت ارسال شد. "
+        "پس از تایید، اشتراک ۳۰ روزه گروه فعال می‌گردد."
+    )
+    try:
+        await bot.send_message(
+            settings.god_admin_id,
+            f"🧾 <b>فیش پرداخت جدید</b>\n"
+            f"🏘 گروه: <b>{title}</b>\n"
+            f"🆔 <code>{chat_id}</code>\n"
+            f"👤 از: <a href=\"tg://user?id={user.id}\">{user.id}</a> ({uname})",
+        )
+        await bot.copy_message(
+            chat_id=settings.god_admin_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+            reply_markup=ui.markup(
+                [
+                    InlineKeyboardButton(
+                        text="✅ تایید و شارژ ۳۰ روزه",
+                        callback_data=f"sub:approve:{chat_id}:{user.id}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="❌ رد فیش",
+                        callback_data=f"sub:reject:{chat_id}:{user.id}",
+                    )
+                ],
+            ),
+        )
+    except Exception:
+        log.warning("receipt forwarding failed chat=%s user=%s", chat_id, user.id)
+
+
+async def _maybe_pay_card(message: Message, bot: Bot) -> bool:
+    """`/start pay_{chat_id}` / `/start sub_{chat_id}` deep-links -> the card."""
+    user = message.from_user
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=1)
+    if len(parts) < 2 or parts[0].split("@", 1)[0].lower() != "/start":
+        return False
+    arg = parts[1].strip()
+    head, _, raw_id = arg.partition("_")
+    raw_id = raw_id.split("@", 1)[0]
+    if not (head in {"pay", "sub"} and raw_id.lstrip("-").isdigit()):
+        return False
+
+    chat_id = int(raw_id)
+    title = str(chat_id)
+    try:
+        chat = await bot.get_chat(chat_id)
+        title = chat.title or title
+    except Exception:
+        pass
+    await groups_store.upsert_group(chat_id, title=title)
+    row = await subscription.record_join(chat_id, title)
+    await message.answer(
+        ui.pay_screen_text(chat_id, title, row.status, row.expires_at),
+        reply_markup=await ui.pay_screen_kb(chat_id),
+    )
+    log.info("pay deep-link chat=%s user=%s", chat_id, user.id if user else 0)
+    return True
+
+
+async def _public_start_parts(user) -> tuple[str, object]:
+    role = await rbac.get_pv_role(user.id)
+    return ui.public_start_text(), kb.public_start_kb(role)
+
+
+async def _public_help_parts(user) -> tuple[str, object]:
+    role = await rbac.get_pv_role(user.id)
+    return ui.public_help_text(), kb.public_help_kb(role)
+
+
+def _is_public_start(message: Message) -> tuple[bool, str]:
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=1)
+    head = parts[0].split("@", 1)[0].lower() if parts else ""
+    return head == "/start", (parts[1].strip() if len(parts) > 1 else "")
+
+
 async def _open_pv(message: Message, state: FSMContext, bot: Bot) -> None:
-    print(f"PV Message received from {message.from_user.id}", flush=True)
     user = message.from_user
     if user is None or user.is_bot:
         return
+    if await _maybe_pay_card(message, bot):
+        return
+
+    is_start, arg = _is_public_start(message)
+    if is_start:
+        await state.clear()
+        text, markup = (
+            await _public_help_parts(user)
+            if arg.split("@", 1)[0].lower() == "help"
+            else await _public_start_parts(user)
+        )
+        await message.answer(text, reply_markup=markup)
+        return
+
+    if await rbac.get_pv_role(user.id) < Role.SUBADMIN:
+        return  # the settings panel itself stays restricted to registered staff
     text, markup = await _root_parts(bot, user, state)
     await message.answer(text, reply_markup=markup)
 
@@ -404,21 +587,155 @@ async def pv_close(cq: CallbackQuery, state: FSMContext) -> None:
             log.debug("pv close failed: %s", exc)
 
 
-@router.callback_query(F.data == "pv:root")
+@router.callback_query(F.data.in_({"pv:root", "pv:home"}))
 async def pv_root(cq: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     user = cq.from_user
     if user is None:
         await _ack(cq)
+        return
+    if await rbac.get_pv_role(user.id) < Role.SUBADMIN:
+        await _ack(cq, RBAC_REJECT, alert=True)
         return
     text, markup = await _root_parts(bot, user, state)
     await _ack(cq)
     await _edit(cq, text, markup)
 
 
+# ------------------------------------------------------- public PV catalog --
+@router.callback_query(F.data == "pv:public:start")
+async def pv_public_start(cq: CallbackQuery, state: FSMContext) -> None:
+    user = cq.from_user
+    if user is None or await _pv_ids(cq) is None:
+        await _ack(cq)
+        return
+    await state.clear()
+    await _ack(cq)
+    text, markup = await _public_start_parts(user)
+    await _edit(cq, text, markup)
+
+
+@router.callback_query(F.data == "pv:public:help")
+async def pv_public_help(cq: CallbackQuery, state: FSMContext) -> None:
+    user = cq.from_user
+    if user is None or await _pv_ids(cq) is None:
+        await _ack(cq)
+        return
+    await state.clear()
+    await _ack(cq)
+    text, markup = await _public_help_parts(user)
+    await _edit(cq, text, markup)
+
+
+@router.callback_query(F.data == "pv:public:mygroups")
+async def pv_public_mygroups(cq: CallbackQuery, state: FSMContext) -> None:
+    user = cq.from_user
+    if user is None or await _pv_ids(cq) is None:
+        await _ack(cq)
+        return
+    await state.clear()
+    await _ack(cq)
+    role = await rbac.get_pv_role(user.id)
+    rows = await _managed(user.id)
+    entries = [(chat_id, title) for chat_id, _role, title in rows]
+    await _edit(
+        cq,
+        ui.public_mygroups_text(entries),
+        kb.public_mygroups_kb(entries, role),
+    )
+
+
+@router.callback_query(F.data.startswith("pv:public:pay:"))
+async def pv_public_pay(cq: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    user = cq.from_user
+    if user is None or await _pv_ids(cq) is None:
+        await _ack(cq)
+        return
+    parts = (cq.data or "").split(":")
+    try:
+        chat_id = int(parts[3].split("@", 1)[0])
+    except (IndexError, ValueError):
+        await _ack(cq)
+        return
+    if await rbac.role_in(chat_id, user.id) < Role.SUBADMIN:
+        await _ack(cq, RBAC_REJECT, alert=True)
+        return
+    await state.clear()
+    await _ack(cq)
+    title = await _group_title(bot, chat_id)
+    row = await subscription.record_join(chat_id, title)
+    await _edit(
+        cq,
+        ui.pay_screen_text(chat_id, title, row.status, row.expires_at),
+        await ui.pay_screen_kb(chat_id, back="pv:public:mygroups"),
+    )
+
+
 @router.callback_query(F.data == "pv:help")
 async def pv_help(cq: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     """Dashboard "help" -> the full role-aware, paginated help menu."""
+    user = cq.from_user
+    if user is None:
+        await _ack(cq)
+        return
+    if await rbac.get_pv_role(user.id) < Role.SUBADMIN:
+        await _ack(cq, RBAC_REJECT, alert=True)
+        return
     await render_menu(cq, state, bot)
+
+
+# ======================================================= SUBSCRIPTION (in-panel)
+@router.callback_query(F.data == "pv:substat")
+async def pv_substat(cq: CallbackQuery, state: FSMContext) -> None:
+    """Main-panel "Subscription & Renewal" -> per-group status list."""
+    user = cq.from_user
+    ids = await _pv_ids(cq)
+    if user is None or ids is None:
+        await _ack(cq)
+        return
+    role = await rbac.get_pv_role(user.id)
+    if role < Role.SUBADMIN:
+        await _ack(cq, RBAC_REJECT, alert=True)
+        return
+    await state.clear()
+    await _ack(cq)
+    if role >= Role.GOD:
+        all_ids = await groups_store.managed_chat_ids()
+        titles = await groups_store.known_titles(all_ids)
+        entries = [(c, Role.GOD, titles.get(c, str(c)) or str(c)) for c in all_ids]
+    else:
+        entries = await _managed(user.id)
+    lines = ["💳 وضعیت اشتراک و تمدید", ""]
+    rows: list[list[InlineKeyboardButton]] = []
+    for chat_id, _role, title in entries[:25]:
+        row = await subscription.record_join(chat_id, title)
+        lines.append(f"• {html.escape(title)}: {ui.status_line(row.status, row.expires_at)}")
+        rows.append([
+            InlineKeyboardButton(text=f"🛡 {title[:40]}"[:64], callback_data=f"pv:substat:{chat_id}")
+        ])
+    if not entries:
+        lines.append("هنوز گروهی ثبت نشده است.")
+    await _edit(cq, "\n".join(lines), ui.markup(*rows, [ui.support_btn()]))
+
+
+@router.callback_query(F.data.startswith("pv:substat:"))
+async def pv_substat_chat(cq: CallbackQuery, state: FSMContext) -> None:
+    user = cq.from_user
+    ids = await _pv_ids(cq)
+    if user is None or ids is None:
+        await _ack(cq)
+        return
+    parts = (cq.data or "").split(":")
+    chat_id = int(parts[2].split("@", 1)[0]) if len(parts) > 2 else 0
+    if not chat_id or await rbac.role_in(chat_id, user.id) < Role.SUBADMIN:
+        await _ack(cq, RBAC_REJECT, alert=True)
+        return
+    await state.clear()
+    await _ack(cq)
+    titles = await groups_store.known_titles([chat_id])
+    title = titles.get(chat_id, str(chat_id))
+    row = await subscription.record_join(chat_id, title)
+    kb = ui.subscribe_kb(chat_id, paid=ui.is_premium(row.status, row.expires_at))
+    await _edit(cq, ui.pay_view_text(chat_id, title, row.status, row.expires_at), kb)
 
 
 # ============================================================== GOD (Level 3) ==
@@ -430,13 +747,19 @@ async def pv_god_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> Non
         await _ack(cq)
         return
     if not await rbac.is_god(user.id):
-        await _ack(cq, "❌ دسترسی ندارید", alert=True)
+        await _ack(cq, RBAC_REJECT, alert=True)
         return
 
     pv_chat, menu_id = ids
     parts = (cq.data or "").split(":")
     action = parts[2] if len(parts) > 2 else ""
     await state.clear()
+
+    if action in {"home", "root"}:
+        await _ack(cq)
+        text, markup = await _root_parts(bot, user, state)
+        await _edit(cq, text, markup)
+        return
 
     # ---- 1. global system status ------------------------------------------
     if action == "sys":
@@ -461,6 +784,75 @@ async def pv_god_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> Non
     if action == "owners":
         await _ack(cq)
         await _edit(cq, await _owners_text(), kb.god_owners_kb(await _owners_rows()))
+        return
+
+    # ---- payments gateway management (directive #2) -----------------------
+    if action == "pay":
+        part3 = parts[3] if len(parts) > 3 else ""
+        if part3 == "tgl" and len(parts) > 4:
+            await settings_store.payment_toggle(int(parts[4]))
+            await _ack(cq, "تغییر ذخیره شد ✅")
+        elif part3 == "del" and len(parts) > 4:
+            await settings_store.payment_delete(int(parts[4]))
+            await _ack(cq, "روش پرداخت حذف شد ✅")
+        elif part3 == "add":
+            await state.set_state(PvGodSG.pay_title)
+            await state.update_data(pv_chat=pv_chat, menu_msg=menu_id)
+            await _ack(cq)
+            await _edit(
+                cq,
+                "⚙️ افزودن حساب/درگاه پرداخت\n\n"
+                "نوع را انتخاب کنید:",
+                kb.god_payment_add_kb(),
+            )
+            return
+        elif part3 == "pt" and len(parts) > 4 and parts[4] in {"card", "crypto"}:
+            await state.set_state(PvGodSG.pay_title)
+            await state.update_data(
+                pv_chat=pv_chat, menu_msg=menu_id, pay_type=parts[4]
+            )
+            await _ack(cq)
+            await _edit(
+                cq,
+                "💳 مرحله ۱ از ۲ — عنوان روش پرداخت را بفرستید\n"
+                "مثال: <code>بانک ملت</code> یا <code>Tether TRC20</code>",
+                kb.god_payment_post_kb(),
+            )
+            return
+        else:
+            await _ack(cq)
+        methods = await settings_store.payment_list(active_only=False)
+        await _edit(cq, _payment_methods_text(methods), kb.god_payment_kb(methods))
+        return
+
+    # ---- SaaS: manual whitelist / manual 30-day activation ----------------
+    if action == "sub" and len(parts) > 4 and parts[3] in {"man", "pay"}:
+        try:
+            chat_id = int(parts[4])
+        except ValueError:
+            await _ack(cq)
+            return
+        title = (await groups_store.known_titles([chat_id])).get(chat_id, str(chat_id))
+        await groups_store.upsert_group(chat_id, title=title)
+        await groups_store.ensure_owner(chat_id)
+        if parts[3] == "man":
+            await subscription.manual_whitelist(chat_id, title)
+            row = await subscription.record_join(chat_id)
+            status = GroupSubscription.MANUAL_WHITELIST
+            note = "🟣 گروه به صورت دستی ثبت شد؛ هرگز درخواست پرداخت نمی‌شود."
+        else:
+            await subscription.activate_paid(chat_id)
+            row = await subscription.record_join(chat_id)
+            status = GroupSubscription.ACTIVE
+            note = "🟢 اشتراک ۳۰ روزه به طور دستی فعال شد."
+        await _ack(cq, "ذخیره شد ✅")
+        await _edit(
+            cq,
+            f"💳 مدیریت دستی اشتراک گروه\n\n"
+            f"🏘 گروه: <code>{chat_id}</code>\n"
+            f"📅 وضعیت: {ui.status_line(status, row.expires_at)}\n\n{note}",
+            ui.markup([ui.btn_cb("[🔙 بازگشت | Back]", "pv:god:owners")]),
+        )
         return
 
     if action == "ow" and len(parts) > 3 and parts[3] == "add":
@@ -492,6 +884,7 @@ async def pv_god_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> Non
         try:
             if level == "2":
                 await rbac.add_admin(target_chat, target_user, granted_by=user.id)
+                await groups_store.ensure_owner(target_chat, target_user)
                 note = (
                     f"کاربر {target_user} به عنوان ادمین گروه (Level 2) "
                     f"گروه {target_chat} ثبت شد."
@@ -505,9 +898,54 @@ async def pv_god_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> Non
         except (PermissionError, ValueError) as exc:
             await _ack(cq, f"❌ {html.escape(str(exc))}", alert=True)
             return
+        await groups_store.upsert_group(target_chat)
         await _ack(cq, "ثبت شد ✅")
         await _edit(
             cq, await _owners_text(note), kb.god_owners_kb(await _owners_rows())
+        )
+        return
+
+    if action == "ow" and len(parts) > 4 and parts[3] == "new":
+        try:
+            chat_id = int(parts[4])
+        except ValueError:
+            await _ack(cq)
+            return
+        title = (await groups_store.known_titles([chat_id])).get(chat_id, str(chat_id))
+        await state.set_state(PvGodSG.owner_user)
+        await state.update_data(
+            pv_chat=pv_chat, menu_msg=menu_id, target_chat=chat_id
+        )
+        await _ack(cq)
+        await _edit(
+            cq,
+            "👤 تغییر مالک گروه\n\n"
+            f"🏘 گروه: {_esc(title)}\n"
+            f"🆔 <code>{chat_id}</code>\n\n"
+            "شناسه عددی مالک جدید (Level 2) را بفرستید:\n"
+            "<code>123456789</code>",
+            kb.god_owner_step_kb(),
+        )
+        return
+
+    if action == "ow" and len(parts) > 4 and parts[3] == "rm":
+        try:
+            chat_id = int(parts[4])
+        except ValueError:
+            await _ack(cq)
+            return
+        await groups_store.remove_chat(chat_id)
+        await rk.presence_remove(chat_id)
+        try:
+            await bot.leave_chat(chat_id)
+        except Exception:
+            log.debug("master leave after remove failed chat=%s", chat_id, exc_info=True)
+        await botpair.worker_leave(chat_id)
+        await _ack(cq, "گروه حذف شد ✅")
+        await _edit(
+            cq,
+            await _owners_text("گروه به طور کامل حذف شد."),
+            kb.god_owners_kb(await _owners_rows()),
         )
         return
 
@@ -522,6 +960,17 @@ async def pv_god_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> Non
         except PermissionError:
             await _ack(cq, "❌ مجوز ندارید", alert=True)
             return
+        # the last owner being unbound revokes the roster entry entirely: the
+        # periodic audit then orders both bots to leave that orphaned group.
+        # Groups holding an actual paid / trial subscription keep their record.
+        if not await rbac.list_owner_ids(chat_id):
+            sub = await subscription.record_join(chat_id)
+            if sub.status in {
+                GroupSubscription.UNPAID,
+                GroupSubscription.EXPIRED,
+                GroupSubscription.MANUAL_WHITELIST,
+            }:
+                await groups_store.remove_chat(chat_id)
         await _ack(cq, "دسترسی لغو شد")
         await _edit(
             cq,
@@ -537,13 +986,17 @@ async def pv_god_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> Non
             await _ack(cq)
             return
         title = (await groups_store.known_titles([chat_id])).get(chat_id, str(chat_id))
+        sub = await subscription.record_join(chat_id)
+        owner = "God Admin" if target == int(settings.god_admin_id) else f"<code>{target}</code>"
         await _ack(cq)
         await _edit(
             cq,
             "👤 جزئیات مدیر گروه\n\n"
-            f"🆔 کاربر: <code>{target}</code>\n"
+            f"🆔 کاربر: {owner}\n"
             f"🏘 گروه: {_esc(title)}\n"
-            f"🆔 شناسه گروه: <code>{chat_id}</code>",
+            f"🆔 شناسه گروه: <code>{chat_id}</code>\n"
+            f"📅 وضعیت اشتراک: {ui.status_line(sub.status, sub.expires_at)}\n"
+            f"🎁 تست رایگان: {'استفاده شد' if sub.trial_used else 'در دسترس'}",
             kb.owner_detail_kb(target, chat_id),
         )
         return
@@ -579,7 +1032,7 @@ async def _require_group(cq: CallbackQuery, chat_id: int, min_role: Role) -> Rol
         return None
     role = await rbac.role_in(chat_id, user.id)
     if role < min_role:
-        await _ack(cq, "❌ دسترسی ندارید", alert=True)
+        await _ack(cq, RBAC_REJECT, alert=True)
         return None
     return role
 
@@ -741,6 +1194,91 @@ async def pv_admin_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> N
         return
 
     await _ack(cq)
+
+
+@router.callback_query(F.data.startswith("modact:"))
+async def modact_callback(cq: CallbackQuery, bot: Bot) -> None:
+    """Handle inline action buttons from PV ModLog cards.
+
+    modact:unmute:<chat_id>:<user_id>  -> fully unmute the user
+    modact:ban:<chat_id>:<user_id>     -> ban the user
+    modact:dismiss                     -> remove the keyboard / delete the card
+    """
+    user = cq.from_user
+    if user is None:
+        await cq.answer()
+        return
+
+    parts = (cq.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "unmute" and len(parts) == 4:
+        chat_id = int(parts[2])
+        target_user_id = int(parts[3])
+        # Only Level 2+ may unmute via the card.
+        role = await rbac.get_role(chat_id, user.id)
+        if role is None or role < Role.ADMIN:
+            await cq.answer("فقط مالک گروه می‌تواند سکوت را لغو کند.", alert=True)
+            return
+        full = ChatPermissions(
+            can_send_messages=True,
+            can_send_audios=True,
+            can_send_documents=True,
+            can_send_photos=True,
+            can_send_videos=True,
+            can_send_video_notes=True,
+            can_send_voice_notes=True,
+            can_send_polls=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
+            can_change_info=False,
+            can_invite_users=False,
+            can_pin_messages=False,
+        )
+        try:
+            await bot.restrict_chat_member(chat_id, target_user_id, permissions=full)
+            new_text = (
+                (cq.message.text or "")
+                + "\n\nوضعیت جدید: 🔊 کاربر توسط ادمین لغو سکوت شد."
+            )
+            await cq.message.edit_text(new_text, parse_mode="HTML")
+            await cq.message.edit_reply_markup(reply_markup=None)
+            await cq.answer("سکوت کاربر لغو شد ✅")
+        except Exception as exc:
+            log.warning("modact unmute failed chat=%s user=%s: %s", chat_id, target_user_id, exc)
+            await cq.answer("خطا در لغو سکوت", alert=True)
+        return
+
+    if action == "ban" and len(parts) == 4:
+        chat_id = int(parts[2])
+        target_user_id = int(parts[3])
+        role = await rbac.get_role(chat_id, user.id)
+        if role is None or role < Role.ADMIN:
+            await cq.answer("فقط مالک گروه می‌تواند کاربر را بن کند.", alert=True)
+            return
+        try:
+            await bot.ban_chat_member(chat_id, target_user_id)
+            new_text = (
+                (cq.message.text or "")
+                + "\n\nوضعیت جدید: ⛔️ کاربر توسط ادمین بن/اخراج شد."
+            )
+            await cq.message.edit_text(new_text, parse_mode="HTML")
+            await cq.message.edit_reply_markup(reply_markup=None)
+            await cq.answer("کاربر بن شد ⛔️")
+        except Exception as exc:
+            log.warning("modact ban failed chat=%s user=%s: %s", chat_id, target_user_id, exc)
+            await cq.answer("خطا در بن کردن کاربر", alert=True)
+        return
+
+    if action == "dismiss":
+        try:
+            await cq.message.edit_reply_markup(reply_markup=None)
+            await cq.answer("نادیده گرفته شد 🗑")
+        except Exception:
+            await cq.answer()
+        return
+
+    await cq.answer()
 
 
 def _int_or_none(raw: str | None) -> int | None:
@@ -1047,6 +1585,61 @@ async def pv_owner_level_hint(message: Message, state: FSMContext) -> None:
     if not await _god_staged(message, state):
         return
     await _notice(message, "❌ لطفاً یکی از دکمه‌های سطح دسترسی را بزنید.")
+
+
+@fsm_router.message(
+    F.chat.type == "private",
+    StateFilter(PvGodSG.pay_title),
+    F.text,
+    F.text.func(lambda t: not t.startswith("/")),
+)
+async def pv_pay_title_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    """Payment gateway step 1/2 - the display title."""
+    if not await _god_staged(message, state):
+        return
+    title = (message.text or "").strip()
+    if not title:
+        return
+    await state.set_state(PvGodSG.pay_value)
+    await state.update_data(pay_title=title[:64])
+    await message.delete()
+    data = await state.get_data()
+    kind = "🪙 ولت ارز دیجیتال" if data.get("pay_type") == "crypto" else "💳 شماره کارت بانکی"
+    await _edit_menu(
+        bot,
+        data,
+        f"⚡️ مرحله ۲ از ۲ — مقدار ({kind}) را بفرستید:\n"
+        "<code>شماره کارت</code> یا <code>آدرس ولت TRC20</code>",
+        kb.god_payment_post_kb(),
+    )
+
+
+@fsm_router.message(
+    F.chat.type == "private",
+    StateFilter(PvGodSG.pay_value),
+    F.text,
+    F.text.func(lambda t: not t.startswith("/")),
+)
+async def pv_pay_value_input(message: Message, state: FSMContext, bot: Bot) -> None:
+    """Payment gateway step 2/2 - the card number / wallet address."""
+    if not await _god_staged(message, state):
+        return
+    value = (message.text or "").strip()
+    data = await state.get_data()
+    ptype = data.get("pay_type") or "card"
+    valid = value.isdigit() and len(value.replace(" ", "")) >= 16 if ptype == "card" else len(value) >= 20
+    if not valid:
+        await _notice(
+            message,
+            "❌ مقدار نامعتبر است. برای کارت فقط رقم (حداقل ۱۶) و برای ولت "
+            "رشته بی‌فاصله (حداقل ۲۰ کاراکتر) بفرستید.",
+        )
+        return
+    await settings_store.payment_add(ptype, data.get("pay_title", ""), value)
+    await message.delete()
+    await state.clear()
+    methods = await settings_store.payment_list(active_only=False)
+    await _edit_menu(bot, data, _payment_methods_text(methods), kb.god_payment_kb(methods))
 
 
 @fsm_router.message(

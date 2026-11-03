@@ -21,6 +21,12 @@ log = logging.getLogger("abgguard.moderation")
 MUTE_REASON = re.compile(r"^mute:(?P<reason>.*):(?P<seconds>\d+)s$")
 # "permamute:<reason>" - a permanent restriction instead of an outright ban
 PERMA_REASON = re.compile(r"^permamute:(?P<reason>.+)$")
+# Public warnings must only ever show the label, never the matched word.
+_BADWORD_PUBLIC = re.compile(r"کلمه رکیک\s*\([^)]*\)")
+
+
+def redact_public_reason(text: str) -> str:
+    return _BADWORD_PUBLIC.sub("کلمه رکیک", text)
 
 NO_SEND = ChatPermissions(
     can_send_messages=False,
@@ -47,6 +53,16 @@ def _spawn(coro, *, name: str) -> asyncio.Task:
     _background.add(task)
     task.add_done_callback(_background.discard)
     return task
+
+
+async def delete_after(bot: Bot, chat_id: int, message_id: int, delay: float) -> None:
+    """Sleep ``delay`` seconds, then safely delete ``message_id``.
+
+    Fire-and-forget: never raises into the caller. Used for auto-cleaning
+    public warnings so the group chat stays uncluttered.
+    """
+    await asyncio.sleep(delay)
+    await safe_delete(bot, chat_id, message_id)
 
 
 async def safe_delete(bot: Bot, chat_id: int, message_id: int) -> bool:
@@ -191,6 +207,9 @@ async def publish_ban_event(
     actor_id: int | None = None,
     actor_source: str | None = None,
     target_name: str | None = None,
+    target_username: str | None = None,
+    content_report: bool = False,
+    message_text: str | None = None,
 ) -> None:
     payload = json.dumps(
         {
@@ -204,6 +223,11 @@ async def publish_ban_event(
             "actor_source": actor_source,
             # how the offender signs in the private mod-log card
             "target_name": target_name,
+            "target_username": target_username,
+            # content violations use the report card (username + numeric id)
+            "content_report": content_report,
+            # verbatim user message for the ModLog card
+            "message_text": message_text,
             "ts": datetime.now(UTC).isoformat(timespec="seconds"),
         }
     )
@@ -236,6 +260,11 @@ async def handle_ban_event(bot: Bot, raw: str, me_id: int) -> None:
         actor_source = str(actor_source) if actor_source else None
         raw_name = data.get("target_name")
         target_name = str(raw_name) if raw_name else None
+        raw_username = data.get("target_username")
+        target_username = str(raw_username).lstrip("@") if raw_username else None
+        content_report = bool(data.get("content_report"))
+        raw_message_text = data.get("message_text")
+        message_text = str(raw_message_text) if raw_message_text else None
     except (ValueError, KeyError, TypeError):
         log.error("malformed ban event: %s", raw[:200])
         return
@@ -264,7 +293,6 @@ async def handle_ban_event(bot: Bot, raw: str, me_id: int) -> None:
     # only that human may reply «بن» to actually remove the member.
     perma_hit = PERMA_REASON.match(reason)
     mute_hit = MUTE_REASON.match(reason)
-    content_report = False
     escalate_owner = False
     if perma_hit is not None:
         await perm_mute(bot, chat_id, user_id)
@@ -302,9 +330,12 @@ async def handle_ban_event(bot: Bot, raw: str, me_id: int) -> None:
     # card travels straight to the admins' PVs - never back into the group.
     # Content violations switch to the dedicated report card, which also
     # carries the offender's numeric id.
-    extra: dict[str, str | None] = (
-        {"template": "content", "target_name": target_name} if content_report else {}
-    )
+    extra: dict[str, str | None] = {}
+    if content_report:
+        extra["template"] = "content"
+        extra["target_name"] = target_name
+        if target_username:
+            extra["target_username"] = target_username
     modlog.notify(
         bot,
         chat_id,
@@ -313,6 +344,7 @@ async def handle_ban_event(bot: Bot, raw: str, me_id: int) -> None:
         actor=actor_id,
         actor_source=actor_source,
         reason=reason,
+        message_text=message_text,
         **extra,
     )
 
@@ -320,13 +352,14 @@ async def handle_ban_event(bot: Bot, raw: str, me_id: int) -> None:
     # verdict. Only the assigned owner of this chat gets the private alert,
     # and only they may reply «بن» to remove the member.
     if escalate_owner:
-        modlog.escalate(
-            bot,
-            chat_id,
-            target=user_id,
-            reason=reason,
-            target_name=target_name,
-        )
+        escalation: dict[str, str | int | None] = {
+            "target": user_id,
+            "reason": reason,
+            "target_name": target_name,
+        }
+        if target_username:
+            escalation["target_username"] = target_username
+        modlog.escalate(bot, chat_id, **escalation)
 
 
 async def delete_and_ban(
@@ -341,6 +374,8 @@ async def delete_and_ban(
     actor_id: int | None = None,
     actor_source: str | None = None,
     target_name: str | None = None,
+    target_username: str | None = None,
+    content_report: bool = False,
 ) -> None:
     """Delete the offending message and queue the sanction event.
 
@@ -360,12 +395,14 @@ async def delete_and_ban(
         actor_id=actor_id,
         actor_source=actor_source,
         target_name=target_name,
+        target_username=target_username,
+        content_report=content_report,
     )
     # The Master bot's dedicated Redis subscriber applies the sanction -
     # both the Worker and the Master funnel through the very same event bus.
     if notify:
         try:
-            await bot.send_message(chat_id, notify)
+            await bot.send_message(chat_id, redact_public_reason(notify))
         except Exception:
             pass
 
@@ -380,6 +417,9 @@ async def delete_and_mute(
     reason: str,
     actor_id: int | None = None,
     actor_source: str | None = None,
+    target_name: str | None = None,
+    target_username: str | None = None,
+    content_report: bool = False,
 ) -> None:
     if message_id:
         await safe_delete(bot, chat_id, message_id)
@@ -390,5 +430,8 @@ async def delete_and_mute(
         reason=f"mute:{reason}:{seconds}s",
         actor_id=actor_id,
         actor_source=actor_source,
+        target_name=target_name,
+        target_username=target_username,
+        content_report=content_report,
     )
     log.info("MUTED user=%s chat=%s for %ss (%s)", user_id, chat_id, seconds, reason)

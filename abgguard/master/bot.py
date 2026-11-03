@@ -11,8 +11,17 @@ from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import ErrorEvent, Update
 
 from abgguard.config import FALLBACK_GOD_ADMIN_ID, settings
+from abgguard.core.botapi import make_session
 from abgguard.core.redis import get_redis
-from abgguard.master.handlers import guards, members, modcmd, panel, pv_panel, rbac
+from abgguard.master.handlers import (
+    guards,
+    media_fallback,
+    members,
+    modcmd,
+    panel,
+    pv_panel,
+    rbac,
+)
 from abgguard.master.handlers.help import router as help_router
 
 log = logging.getLogger("abgguard.master.dispatch")
@@ -119,6 +128,7 @@ def create_master(token: str) -> tuple[Bot, Dispatcher]:
     bot = Bot(
         token=token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        session=make_session(),
     )
     dp = Dispatcher(storage=RedisStorage(redis=get_redis()))
 
@@ -132,6 +142,7 @@ def create_master(token: str) -> tuple[Bot, Dispatcher]:
     dp.include_router(modcmd.router)
     dp.include_router(panel.fsm_router)
     dp.include_router(panel.router)
+    dp.include_router(media_fallback.router)
     dp.include_router(guards.router)
     dp.include_router(members.router)
 

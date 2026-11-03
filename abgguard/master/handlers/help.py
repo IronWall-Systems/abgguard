@@ -16,6 +16,8 @@ from aiogram.types import (
 from abgguard.config import settings
 from abgguard.core import rbac
 from abgguard.core.rbac import Role
+from abgguard.master import pv_keyboards as pv_kb
+from abgguard.master import ui
 from abgguard.master.ephemeral import delete_later, fa_num, spawn
 from abgguard.services.textguards import is_bot_message
 
@@ -123,9 +125,12 @@ SECTIONS: dict[str, Section] = {
                 "• اخطار اول ← ۱۰ دقیقه سکوت\n"
                 "• اخطار دوم ← سکوت دائم + ارجاع به مالک گروه\n\n"
                 "🧹 پاکسازی\n"
-                "<code>/purge</code> یا <code>/پاکسازی</code>\n"
-                "پیام‌های اخیر گروه را پاک می‌کند. پیش‌فرض ۲۰ پیام؛ "
-                "<code>/purge 50</code> برای ۵۰ پیام (حداکثر ۱۰۰).\n\n"
+                "<code>/purge [تعداد]</code> ← حذف پیام‌های اخیر "
+                "(پیش‌فرض ۲۰، حداکثر ۱۰۰).\n"
+                "<code>/wipe</code> یا «پاکسازی» با ریپلای ← حذف همهٔ پیام‌ها "
+                "از پیام ریپلای‌شده تا همین دستور.\n"
+                "<code>/wipeall</code> یا «پاکسازی همه» ← پاکسازی پنجرهٔ "
+                "امن ۲۰۰ پیام اخیر (محدودیت ۴۸ ساعتهٔ Bot API).\n\n"
                 "💡 خود دستور و پاسخ ربات خودبه‌خود بعد از ۱۰ ثانیه پاک می‌شود.\n"
                 "💡 برای تیم مدیریت، نوشتن تک‌کلمهٔ «سکوت» یا «اخطار» هم اجرا می‌شود."
             ),
@@ -420,7 +425,9 @@ def guide_text() -> str:
         "• <code>/unmute</code> یا «لغو سکوت» ← لغو سکوت کاربر\n"
         "• <code>/بن</code> یا <code>/ban</code> ← فقط مالک گروه و گاد ادمین؛ "
         "ربات هرگز خودش بن نمی‌زند\n"
-        "• <code>/پاکسازی</code> یا <code>/purge</code> ← پاک کردن پیام‌های اخیر\n"
+        "• <code>/purge [تعداد]</code> ← پاک کردن پیام‌های اخیر؛ "
+        "<code>/wipe</code> یا «پاکسازی» با ریپلای ← پاک‌سازی بازه‌ای؛ "
+        "<code>/wipeall</code> یا «پاکسازی همه» ← پاک‌سازی پنجرهٔ امن اخیر\n"
         "💡 خود دستور و پاسخ ربات در همان لحظه حذف می‌شود (پروتکل چت تمیز).\n\n"
         "<b>۳) کاربر ویژه ۳ ساعته 🌟</b>\n"
         "ریپلای روی پیام عضو + نوشتن «ویژه» یا «وی‌آی‌پی» ← او ۳ ساعت از قفل‌ها مستثنا "
@@ -530,16 +537,15 @@ async def _bot_username(bot: Bot) -> str:
     return _bot_username_cache
 
 
-async def _open_menu(message: Message, state: FSMContext, bot: Bot) -> None:
-    print(f"PV Message received from {message.from_user.id}", flush=True)
+async def _open_menu(message: Message, state: FSMContext, _bot: Bot) -> None:
+    """PV /help and `/start help` open the full public catalog for everyone."""
     user = message.from_user
     if user is None or user.is_bot:
         return
     await state.clear()
     role = await rbac.get_pv_role(user.id)
-    username = await _bot_username(bot)
     await message.answer(
-        menu_text(role, 0), reply_markup=menu_kb(role, 0, username)
+        ui.public_help_text(), reply_markup=pv_kb.public_help_kb(role)
     )
 
 

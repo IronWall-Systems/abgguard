@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -14,7 +15,7 @@ from abgguard.core.rbac import Role
 from abgguard.core.redis import VIP_TTL, revoke_user_vip, set_user_vip
 from abgguard.master.ephemeral import fa_num, notice
 from abgguard.models.entities import BanLog
-from abgguard.services import moderation, modlog, strikes
+from abgguard.services import moderation, modlog, strikes, subscription
 from abgguard.services.textguards import is_bot_message
 
 log = logging.getLogger("abgguard.master.modcmd")
@@ -22,6 +23,20 @@ log = logging.getLogger("abgguard.master.modcmd")
 router = Router(name="master.modcmd")
 
 GROUPS = {"group", "supergroup"}
+
+
+async def _sub_active(chat_id: int) -> bool:
+    """SaaS gate shared by every moderation command path (fail-closed)."""
+    return await subscription.is_active(chat_id)
+
+
+async def _require_subscription(message: Message, bot: Bot) -> bool:
+    """Refuse the command in UNPAID/EXPIRED groups and show the renewal card."""
+    if await _sub_active(message.chat.id):
+        return True
+    await subscription.send_expiry_notice(bot, message.chat.id)
+    return False
+
 
 DEFAULT_MUTE = 600  # 10 minutes - the same first-strike mute the guards use
 MAX_MUTE = 366 * 24 * 3600
@@ -44,11 +59,20 @@ ALIASES: dict[str, str] = {
     "اخطار": "warn",
     "purge": "purge",
     "clean": "purge",
-    "پاکسازی": "purge",
+    "wipe": "wipe",
+    "wipeall": "wipe_all",
+    "پاکسازی": "wipe",
     # hand the default send rights back after a mute
     "unmute": "unmute",
     "لغو سکوت": "unmute",
     "حذف سکوت": "unmute",
+}
+
+# Bare (slash-less) phrases for the full-history wipe. They are matched only
+# for staff, exactly like the other plain triggers.
+FULL_WIPE_TRIGGERS: dict[str, str] = {
+    "پاکسازی همه": "wipe_all",
+    "wipe all": "wipe_all",
 }
 
 # Default send rights restored by /unmute. `can_send_media_messages` left the
@@ -76,7 +100,7 @@ BAN_NOTICE = "⚠️ شما دسترسی بن کردن ندارید."
 # Words that also work *without* a slash when written alone in the group.
 # Only the two triggers named by project rule 6 - "بن" stays command-only
 # because the bare word is far too common to consume silently.
-PLAIN_TRIGGERS = frozenset({"سکوت", "اخطار"})
+PLAIN_TRIGGERS = frozenset({"سکوت", "اخطار", "پاکسازی", "wipe"})
 
 # Unmute, too, is reply-driven and staff-only: these two spellings work as a
 # bare message, "لغو سکوت" / "حذف سکوت", alongside the /unmute command.
@@ -92,6 +116,8 @@ VIP_REVOKE_WORDS = ("لغو ویژه", "لغو وی‌آی‌پی")
 # confirmation notice (Clean Chat Protocol, §6). "حذف سکوت" is a different,
 # already claimed trigger, so the bare word never collides with /unmute.
 REMOVE_TRIGGERS = frozenset({"remove", "حذف"})
+PIN_TRIGGERS = frozenset({"pin", "پین"})
+UNPIN_TRIGGERS = frozenset({"unpin", "حذف پین"})
 
 _DURATION_RE = re.compile(r"^(\d+)\s*([smhd]?)$", re.IGNORECASE)
 
@@ -113,7 +139,9 @@ def is_plain_trigger(text: str | None) -> bool:
     raw = (text or "").strip()
     if not raw or raw.startswith("/"):
         return False
-    return raw in PLAIN_TRIGGERS or raw in UNMUTE_TRIGGERS
+    return (
+        raw in PLAIN_TRIGGERS or raw in UNMUTE_TRIGGERS or raw in FULL_WIPE_TRIGGERS
+    )
 
 
 def is_remove_trigger(text: str | None) -> bool:
@@ -122,6 +150,18 @@ def is_remove_trigger(text: str | None) -> bool:
     if not raw or raw.startswith("/"):
         return False
     return raw in REMOVE_TRIGGERS
+
+
+def is_pin_trigger(text: str | None) -> bool:
+    """step 6: exact "پین" / "pin" / "/pin" - reply decides what gets pinned."""
+    raw = (text or "").strip()
+    return raw in PIN_TRIGGERS or raw.split("@", 1)[0].lower() == "/pin"
+
+
+def is_unpin_trigger(text: str | None) -> bool:
+    """step 6: exact "حذف پین" / "unpin" / "/unpin"."""
+    raw = (text or "").strip()
+    return raw in UNPIN_TRIGGERS or raw.split("@", 1)[0].lower() == "/unpin"
 
 
 def parse_mod_command(text: str | None) -> tuple[str, str] | None:
@@ -140,6 +180,8 @@ def parse_mod_command(text: str | None) -> tuple[str, str] | None:
 
     if raw in PLAIN_TRIGGERS or raw in UNMUTE_TRIGGERS:
         return ALIASES[raw], ""
+    if raw in FULL_WIPE_TRIGGERS:
+        return FULL_WIPE_TRIGGERS[raw], ""
     return None
 
 
@@ -252,6 +294,32 @@ class RemoveTrigger(Filter):
         if message.reply_to_message is None:
             return False
         if not is_remove_trigger(message.text):
+            return False
+        user, chat = message.from_user, message.chat
+        if user is None or chat is None or is_bot_message(message):
+            return False
+        return await rbac.get_role(chat.id, user.id) >= Role.SUBADMIN
+
+
+class PinTrigger(Filter):
+    """step 6: a *reply* reading exactly ``"پین"`` / ``"pin"`` - staff only."""
+
+    async def __call__(self, message: Message) -> bool:
+        if message.reply_to_message is None:
+            return False
+        if not is_pin_trigger(message.text):
+            return False
+        user, chat = message.from_user, message.chat
+        if user is None or chat is None or is_bot_message(message):
+            return False
+        return await rbac.get_role(chat.id, user.id) >= Role.SUBADMIN
+
+
+class UnpinTrigger(Filter):
+    """step 6: ``"حذف پین"`` / ``"unpin"`` anywhere in the group - staff only."""
+
+    async def __call__(self, message: Message) -> bool:
+        if not is_unpin_trigger(message.text):
             return False
         user, chat = message.from_user, message.chat
         if user is None or chat is None or is_bot_message(message):
@@ -457,6 +525,84 @@ async def _do_warn(message: Message, bot, target: int, target_name: str | None =
     )
 
 
+# --------------------------------------------------------------- bulk wipe ---
+async def _do_wipe(message: Message, bot) -> None:
+    reply = message.reply_to_message
+    if reply is None:
+        await notice(
+            message,
+            "⚠️ برای پاکسازی، روی اولین پیامی که می‌خواهید حذف شود ریپلای کرده و "
+            "کلمه «پاکسازی» را ارسال کنید.",
+            delay=5.0,
+        )
+        return
+
+    start = reply.message_id
+    end = message.message_id
+    if start > end:
+        start, end = end, start
+
+    for chunk_start in range(start, end + 1, 100):
+        chunk = list(range(chunk_start, min(chunk_start + 100, end + 1)))
+        try:
+            await bot.delete_messages(message.chat.id, chunk)
+        except Exception as exc:
+            log.debug("wipe chunk failed (%s), falling back to one-by-one", exc)
+            for message_id in chunk:
+                await moderation.safe_delete(bot, message.chat.id, message_id)
+        if chunk_start + 100 <= end:
+            await asyncio.sleep(1.5)
+
+    await notice(
+        message,
+        "✅ پیام‌ها تا این نقطه با موفقیت پاکسازی شدند.",
+        delay=5.0,
+    )
+    log.info("WIPE by %s on %s from=%s to=%s", _actor(message), message.chat.id, start, end)
+
+
+WIPE_ALL_DEPTH = 200
+WIPE_ALL_SLEEP = 0.3
+
+
+async def _do_wipe_all(message: Message, bot) -> None:
+    """Delete history backwards from the command message.
+
+    Requests go through the configured local Bot API session, so messages older
+    than the cloud 48-hour window can be removed too.  Each id is probed
+    individually; a missing, forbidden, or rate-limited id is logged and the
+    walk continues.
+    """
+    chat_id = message.chat.id
+    top = message.message_id
+    floor = max(1, top - WIPE_ALL_DEPTH)
+    deleted = 0
+
+    for message_id in range(top - 1, floor - 1, -1):
+        try:
+            if await bot.delete_message(chat_id, message_id):
+                deleted += 1
+        except Exception as err:
+            log.error(f"Wipe delete failed for msg_id {message_id}: {err}")
+        if message_id > floor:
+            await asyncio.sleep(WIPE_ALL_SLEEP)
+
+    text = (
+        "✅ پیام‌های اخیر قابل دسترس گروه پاکسازی شد."
+        if deleted
+        else "⚠️ هیچ پیامی در پنجرهٔ ۲۰۰ پیامی اخیر قابل حذف نبود."
+    )
+    await notice(message, text, delay=5.0)
+    log.info(
+        "WIPE ALL by %s on %s from=%s to=%s deleted=%s",
+        _actor(message),
+        chat_id,
+        floor,
+        top - 1,
+        deleted,
+    )
+
+
 async def _do_purge(message: Message, bot, args: str) -> None:
     chat_id = message.chat.id
     count = parse_count(args)
@@ -490,6 +636,9 @@ async def on_mod_command(message: Message, bot: Bot) -> None:
     name, args = parsed
     role = await rbac.get_role(chat.id, actor.id)
 
+    if not await _require_subscription(message, bot):
+        return
+
     if role < Role.SUBADMIN:
         # only reachable through an explicit slash command - give feedback
         await _ack_delete(message, bot)
@@ -501,6 +650,14 @@ async def on_mod_command(message: Message, bot: Bot) -> None:
     if name == "ban" and role < Role.ADMIN:
         # rule §3: Level 1 may silence and warn, never remove a member.
         await notice(message, BAN_NOTICE)
+        return
+
+    if name == "wipe_all":
+        await _do_wipe_all(message, bot)
+        return
+
+    if name == "wipe":
+        await _do_wipe(message, bot)
         return
 
     if name == "purge":
@@ -552,6 +709,8 @@ async def on_remove_command(message: Message, bot: Bot) -> None:
     chat = message.chat
     if actor is None or chat is None or is_bot_message(message):
         return
+    if not await _require_subscription(message, bot):
+        return
     if await rbac.get_role(chat.id, actor.id) < Role.SUBADMIN:
         return
 
@@ -566,6 +725,70 @@ async def on_remove_command(message: Message, bot: Bot) -> None:
     log.info("REMOVE by %s on %s -> msg %s", actor.id, chat.id, removed)
 
 
+# ------------------------------------------------------------- pin / unpin ---
+async def on_pin_command(message: Message, bot: Bot) -> None:
+    """step 6: reply "پین" - pin the replied message (Clean Chat protocol)."""
+    actor = message.from_user
+    chat = message.chat
+    if actor is None or chat is None or is_bot_message(message):
+        return
+    if not await _require_subscription(message, bot):
+        return
+    if await rbac.get_role(chat.id, actor.id) < Role.SUBADMIN:
+        return
+    reply = message.reply_to_message
+    if reply is None:
+        return
+
+    await _ack_delete(message, bot)
+    try:
+        await bot.pin_chat_message(
+            chat_id=chat.id, message_id=reply.message_id, disable_notification=False
+        )
+    except Exception as exc:
+        log.debug("pin failed: %s", exc)
+        await notice(message, "❌ پین انجام نشد (دسترسی پین برای ربات فعال نیست).", delay=7.0)
+        return
+    await notice(message, "📌 پیام با موفقیت پین شد.", delay=7.0)
+    log.info("PIN by %s on %s -> msg %s", actor.id, chat.id, reply.message_id)
+
+
+async def on_unpin_command(message: Message, bot: Bot) -> None:
+    """step 6: "حذف پین" - unpin the replied message, or the latest pin."""
+    actor = message.from_user
+    chat = message.chat
+    if actor is None or chat is None or is_bot_message(message):
+        return
+    if not await _require_subscription(message, bot):
+        return
+    if await rbac.get_role(chat.id, actor.id) < Role.SUBADMIN:
+        return
+
+    reply = message.reply_to_message
+    await _ack_delete(message, bot)
+    try:
+        if reply is not None:
+            await bot.unpin_chat_message(chat_id=chat.id, message_id=reply.message_id)
+        else:
+            await bot.unpin_chat_message(chat_id=chat.id)
+    except Exception as exc:
+        log.debug("unpin failed: %s", exc)
+        await notice(message, "❌ برداشتن پین انجام نشد.", delay=7.0)
+        return
+    await notice(message, "📌 پین پیام برداشته شد.", delay=7.0)
+    log.info("UNPIN by %s on %s", actor.id, chat.id)
+
+
+@router.message(PinTrigger())
+async def pin_entry(message: Message, bot: Bot) -> None:
+    await on_pin_command(message, bot)
+
+
+@router.message(UnpinTrigger())
+async def unpin_entry(message: Message, bot: Bot) -> None:
+    await on_unpin_command(message, bot)
+
+
 # --------------------------------------------------------- temporary VIP ----
 @router.message(VipTrigger())
 async def on_vip_command(message: Message, bot: Bot) -> None:
@@ -575,6 +798,8 @@ async def on_vip_command(message: Message, bot: Bot) -> None:
     chat = message.chat
     target = reply.from_user if reply is not None else None
     if action is None or actor is None or chat is None or target is None:
+        return
+    if not await _require_subscription(message, bot):
         return
 
     await _ack_delete(message, bot)

@@ -404,7 +404,7 @@ def test_purge_bulk_deletes_the_requested_window(master) -> None:
 
 def test_purge_defaults_to_twenty_messages(master) -> None:
     REC.staff(Role.SUBADMIN)
-    _feed(master, _message("/پاکسازی", message_id=100))
+    _feed(master, _message("/purge", message_id=100))
     assert len(REC.bulk[0][1]) == modcmd.DEFAULT_PURGE
 
 

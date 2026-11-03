@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import ClassVar
 
 from tortoise import fields, models
 
@@ -112,4 +113,68 @@ class BanLog(BaseModel):
         table = "ban_log"
 
 
-ALL_MODELS = [GodAdmin, Group, RoleBinding, GroupSettings, GroupPolicy, BadWord, BanLog]
+class GroupSubscription(BaseModel):
+    """
+    SaaS subscription state for one group (`chat_id`).
+
+    `MANUAL_WHITELIST` rows carry `expires_at = None` and are never billed.
+    `notified_days` is an int bitmask (1 = 1-day warning sent, 2 = 2-day,
+    4 = 3-day) reset on every renewal so each threshold fires once per cycle.
+    """
+
+    TRIAL = "TRIAL"
+    ACTIVE = "ACTIVE"
+    MANUAL_WHITELIST = "MANUAL_WHITELIST"
+    EXPIRED = "EXPIRED"
+    UNPAID = "UNPAID"
+
+    notified_1, notified_2, notified_3 = 1, 2, 4
+    notified_bits: ClassVar[dict[str, int]] = {"3": 4, "2": 2, "1": 1}
+
+    chat_id = fields.BigIntField(unique=True, index=True)
+    title = fields.CharField(max_length=255, null=True)
+    status = fields.CharField(max_length=24, default=UNPAID, index=True)
+    expires_at = fields.DatetimeField(null=True)
+    trial_used = fields.BooleanField(default=False)
+    notified_days = fields.IntField(default=0)
+
+    class Meta:
+        table = "group_subscription"
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"GroupSubscription({self.chat_id}, {self.status})"
+
+
+class PaymentMethod(BaseModel):
+    """God-managed payment gateways shown on the SaaS payment screen.
+
+    `type` is "card" (bank card number) or "crypto" (USDT wallet address);
+    users get one `CopyTextButton` per active row.
+    """
+
+    CARD = "card"
+    CRYPTO = "crypto"
+
+    type = fields.CharField(max_length=8, default=CARD)
+    title = fields.CharField(max_length=64)
+    value = fields.CharField(max_length=128)
+    is_active = fields.BooleanField(default=True)
+
+    class Meta:
+        table = "payment_method"
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"PaymentMethod({self.type}, {self.title})"
+
+
+ALL_MODELS = [
+    GodAdmin,
+    Group,
+    RoleBinding,
+    GroupSettings,
+    GroupPolicy,
+    BadWord,
+    BanLog,
+    GroupSubscription,
+    PaymentMethod,
+]

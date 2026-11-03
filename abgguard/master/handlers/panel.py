@@ -13,6 +13,7 @@ from abgguard.core import rbac, settings_store
 from abgguard.core import trigger as trigger_store
 from abgguard.core.rbac import Role
 from abgguard.core.settings_store import INV_RKEY, GroupFlags
+from abgguard.master import ui
 from abgguard.master.ephemeral import fa_num, notice
 from abgguard.master.keyboards import (
     badwords_menu_kb,
@@ -21,6 +22,7 @@ from abgguard.master.keyboards import (
     trigger_menu_kb,
 )
 from abgguard.master.states import PanelSG
+from abgguard.services import subscription
 from abgguard.services.textguards import is_bot_message
 
 log = logging.getLogger("abgguard.master.panel")
@@ -29,6 +31,9 @@ fsm_router = Router(name="master.panel-fsm")
 router = Router(name="master.panel")
 
 PANEL_TITLE = "🛡 پنل مدیریت گروه"
+
+# step 2: strict RBAC - unregistered users are kept out of the panel
+RBAC_REJECT = "⛔️ فقط ادمین‌ها و ساب‌ادمین‌های ثبت‌شده به پنل دسترسی دارند."
 
 HELP_TEXT = (
     "❓ راهنما\n\n"
@@ -114,6 +119,14 @@ async def open_panel(message: Message, state: FSMContext | None = None) -> None:
 
     await message.delete()
     await groups_store.upsert_group(chat_id, title=message.chat.title)
+
+    # step 3: EXPIRED/UNPAID groups get the exact pause notice, never the panel
+    # (rate-limited: at most one notice every 10 minutes per chat - no spam)
+    await subscription.record_join(chat_id, message.chat.title)
+    if not await subscription.is_active(chat_id):
+        await subscription.send_expiry_notice(message.bot, chat_id)
+        return
+
     flags = await settings_store.get_flags(chat_id)
     trigger = await trigger_store.get_trigger(chat_id)
     await message.answer(
@@ -296,8 +309,33 @@ async def on_panel_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> N
     chat_id = msg.chat.id
     actor = cq.from_user
     role = await rbac.get_role(chat_id, actor.id)
+    if role < Role.SUBADMIN:
+        await _ack(cq, RBAC_REJECT, alert=True)
+        return
+    if not await subscription.is_active(chat_id):
+        if msg.chat.type == "private":
+            await _ack(cq, subscription.EXPIRY_NOTICE_TEXT, alert=True)
+        else:
+            await subscription.send_expiry_notice(cq.bot, chat_id)
+            await _ack(cq)
+        return
     parts = (cq.data or "").split(":")
     action = parts[1] if len(parts) > 1 else ""
+
+    # ---- subscription card (step 3) --------------------------------------
+    if action == "sub":
+        title = msg.chat.title or str(chat_id)
+        row = await subscription.record_join(chat_id, title)
+        await _ack(cq)
+        try:
+            await cq.bot.send_message(
+                chat_id,
+                ui.pay_view_text(chat_id, title, row.status, row.expires_at),
+                reply_markup=ui.renew_kb(chat_id),
+            )
+        except Exception as exc:
+            log.debug("subscription card failed: %s", exc)
+        return
 
     # ---- boolean toggles -------------------------------------------------
     if action == "lock" and len(parts) > 2:

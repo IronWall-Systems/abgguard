@@ -21,8 +21,11 @@ from aiogram.exceptions import (
     TelegramForbiddenError,
     TelegramRetryAfter,
 )
+from aiogram.types import InlineKeyboardMarkup
 
+from abgguard.config import settings
 from abgguard.core import groups, rbac
+from abgguard.master import ui
 
 log = logging.getLogger("abgguard.modlog")
 
@@ -44,6 +47,20 @@ UNKNOWN_ACTOR = "سیستم/ربات"
 
 # strong references so scheduled fan-outs are never garbage collected mid-flight
 _tasks: set[asyncio.Task] = set()
+
+# The Master bot (@abgguardbot) owns every private audit card. A worker-side
+# fallback handler may pass its own Bot instance; this binding keeps delivery on
+# the Master token regardless of who produced the sanction.
+_master_bot: Bot | None = None
+
+
+def bind_master_bot(bot: Bot) -> None:
+    global _master_bot
+    _master_bot = bot
+
+
+def _delivery_bot(bot: Bot | None) -> Bot | None:
+    return _master_bot or bot
 
 
 async def recipients(chat_id: int, *, extra: tuple[int, ...] = ()) -> list[int]:
@@ -115,6 +132,10 @@ async def resolve_group_title(bot: Bot, chat_id: int) -> str:
     return str(chat_id)
 
 
+def _username_line(username: str | None) -> str:
+    return f"@{html.escape(username.lstrip('@'))}" if username else "—"
+
+
 def render_report(
     *,
     group_title: str,
@@ -122,18 +143,23 @@ def render_report(
     action: str,
     reason: str,
     target_name: str | None = None,
+    target_username: str | None = None,
+    message_text: str | None = None,
 ) -> str:
-    """The content-violation report: always names the offender's numeric id."""
+    """The content-violation report: names the Telegram username + numeric id."""
     label = html.escape(target_name) if target_name else str(target)
     lines = [
         "🚨 گزارش اعمال قانون (تخلف محتوا)",
         "",
         f"👥 گروه: {html.escape(str(group_title))}",
         f'👤 کاربر متخلف: <a href="tg://user?id={target}">{label}</a>',
+        f"🔗 آیدی تلگرام: {_username_line(target_username)}",
         f"🆔 آیدی عددی: <code>{target}</code>",
         f"⚖️ اقدام ربات: {html.escape(action)}",
         f"📝 علت: {html.escape(reason)}",
     ]
+    if message_text:
+        lines.append(f"💬 متن اصلی پیام: {html.escape(message_text)}")
     return "\n".join(lines)
 
 
@@ -169,14 +195,19 @@ async def deliver(
     roster: list[int] | None = None,
     template: str = "standard",
     target_name: str | None = None,
+    target_username: str | None = None,
+    message_text: str | None = None,
 ) -> int:
     """Send the card to every assigned admin; returns how many got it.
 
     Never raises: a broken roster or a dead recipient only lowers the count.
     ``template="content"`` switches to the content-violation report, which is
-    the only card that carries the offender's numeric id.
+    the only card that carries the offender's Telegram username + numeric id.
     """
-    ids = list(roster) if roster is not None else await recipients(chat_id)
+    bot = _delivery_bot(bot)
+    roster_ids = list(roster) if roster is not None else await recipients(chat_id)
+    # God Admin always receives the private card (oversight of every group).
+    ids = list(dict.fromkeys([settings.god_admin_id, *roster_ids]))
     if not ids or bot is None:
         return 0
 
@@ -187,6 +218,8 @@ async def deliver(
             action=action,
             reason=reason,
             target_name=target_name,
+            target_username=target_username,
+            message_text=message_text,
         )
     else:
         text = render(
@@ -197,9 +230,44 @@ async def deliver(
             actor_source=actor_source,
             reason=reason,
         )
+
+    # Inline action buttons for the God Admin / Level 2 owners on content cards.
+    markup: InlineKeyboardMarkup | None = None
+    if template == "content":
+        markup = ui.markup(
+            [
+                ui.btn_cb(
+                    "🔊 لغو سکوت (Unmute)",
+                    f"modact:unmute:{chat_id}:{target}",
+                ),
+                ui.btn_cb(
+                    "⛔️ اخراج (Ban)",
+                    f"modact:ban:{chat_id}:{target}",
+                ),
+                ui.btn_cb("🗑 نادیده گرفتن", "modact:dismiss"),
+            ]
+        )
+
     sent = 0
     for user_id in ids:
-        sent += int(await _send(bot, user_id, text))
+        try:
+            await bot.send_message(
+                user_id, text, parse_mode=PARSE_MODE, reply_markup=markup
+            )
+            sent += 1
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(min(float(exc.retry_after), FLOOD_CAP))
+            try:
+                await bot.send_message(
+                    user_id, text, parse_mode=PARSE_MODE, reply_markup=markup
+                )
+                sent += 1
+            except Exception:
+                log.debug("mod-log retry undeliverable user=%s", user_id)
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            log.debug("mod-log undeliverable user=%s (%s)", user_id, exc)
+        except Exception:
+            log.warning("mod-log delivery failed user=%s", user_id, exc_info=True)
     log.info(
         "mod-log chat=%s target=%s actor=%s(%s) template=%s delivered=%s/%s",
         chat_id,
@@ -236,6 +304,7 @@ def render_escalation(
     target: int,
     reason: str,
     target_name: str | None = None,
+    target_username: str | None = None,
 ) -> str:
     """The private Level 2 alert (rule 8: HTML-escaped, self-contained)."""
     label = html.escape(target_name) if target_name else str(target)
@@ -244,6 +313,7 @@ def render_escalation(
         "",
         f"👥 گروه: {html.escape(str(group_title))}",
         f'👤 کاربر متخلف: <a href="tg://user?id={target}">{label}</a>',
+        f"🔗 آیدی تلگرام: {_username_line(target_username)}",
         f"🆔 آیدی عددی: <code>{target}</code>",
         "⚖️ وضعیت فعلی: سکوت دائم توسط ربات",
         f"📝 علت تخلف: {html.escape(reason)}{ESCALATION_CAVEAT}",
@@ -261,8 +331,10 @@ async def deliver_escalation(
     target: int,
     reason: str,
     target_name: str | None = None,
+    target_username: str | None = None,
 ) -> int:
     """Strictly the Level 2 owners; returns how many of them got the alert."""
+    bot = _delivery_bot(bot)
     if bot is None:
         return 0
     ids = await owners(chat_id)
@@ -273,6 +345,7 @@ async def deliver_escalation(
         target=target,
         reason=reason,
         target_name=target_name,
+        target_username=target_username,
     )
     sent = 0
     for user_id in ids:
@@ -294,6 +367,7 @@ def escalate(
     target: int,
     reason: str,
     target_name: str | None = None,
+    target_username: str | None = None,
 ) -> None:
     """Schedule the Level 2 alert without ever blocking the caller (§7)."""
     try:
@@ -308,6 +382,7 @@ def escalate(
             target=target,
             reason=reason,
             target_name=target_name,
+            target_username=target_username,
         ),
         name=f"escalation:{chat_id}",
     )
@@ -336,6 +411,8 @@ def notify(
     roster: list[int] | None = None,
     template: str = "standard",
     target_name: str | None = None,
+    target_username: str | None = None,
+    message_text: str | None = None,
 ) -> None:
     """Schedule the private fan-out without ever blocking the caller (§7).
 
@@ -359,6 +436,8 @@ def notify(
             roster=roster,
             template=template,
             target_name=target_name,
+            target_username=target_username,
+            message_text=message_text,
         ),
         name=f"modlog:{chat_id}",
     )

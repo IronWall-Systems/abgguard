@@ -8,9 +8,15 @@ from aiogram.types import Message
 from abgguard.core import rbac, settings_store
 from abgguard.core import redis as rk
 from abgguard.core.rbac import Role
-from abgguard.services import antiflood, strikes, textguards
+from abgguard.services import antiflood, strikes, subscription, textguards
 from abgguard.services.harvester import harvester
-from abgguard.services.moderation import delete_and_ban, delete_and_mute, safe_delete
+from abgguard.services.moderation import (
+    _spawn,
+    delete_after,
+    delete_and_ban,
+    delete_and_mute,
+    safe_delete,
+)
 from abgguard.services.textguards import find_emoji, find_link, is_bot_message
 
 log = logging.getLogger("abgguard.master.guards")
@@ -61,14 +67,22 @@ async def _escalate(
     user_id: int,
     message_id: int,
     reason: str,
+    log_reason: str | None = None,
     first_mute: int = 600,
     target_name: str | None = None,
+    target_username: str | None = None,
+    content_report: bool = False,
+    message_text: str | None = None,
 ) -> None:
     """1st strike -> timed mute, repeat strike -> permanent mute + Level 2 alert.
 
+    ``reason`` is the public wording and must never carry the matched bad word;
+    ``log_reason`` (optional) is the exact private ModLog reason for admins.
+    ``message_text`` is the raw user message, logged verbatim in the ModLog.
     The bot never bans: hitting the ceiling silences the member forever and
     hands the final «بن» decision to the assigned group owner in private.
     """
+    private_reason = log_reason or reason
     await safe_delete(bot, chat_id, message_id)
     await _mark_dirty(chat_id, message_id)
     strike = await strikes.register(chat_id, user_id)
@@ -80,16 +94,21 @@ async def _escalate(
             user_id=user_id,
             message_id=None,
             seconds=first_mute,
-            reason=reason,
+            reason=private_reason,
             actor_source="master",
+            target_name=target_name,
+            target_username=target_username,
+            content_report=content_report,
         )
         try:
-            await bot.send_message(
+            warning = await bot.send_message(
                 chat_id,
                 f"⚠️ اخطار ۱ برای {_mention_id(user_id)}\n"
                 f"دلیل: {reason}\n"
                 f"تا {first_mute // 60} دقیقه سکوت.",
             )
+            # Auto-delete the public warning after 30s to keep the group clean.
+            _spawn(delete_after(bot, chat_id, warning.message_id, 30.0), name="warn-clean")
         except Exception:
             pass
         return
@@ -99,11 +118,13 @@ async def _escalate(
         chat_id=chat_id,
         user_id=user_id,
         message_id=None,
-        reason=reason,
+        reason=private_reason,
         notify=f"🔇 {_mention_id(user_id)} به دلیل تکرار تخلف ({reason}) "
         "برای همیشه سکوت شد؛ تصمیم نهایی با مالک گروه است.",
         actor_source="master",
         target_name=target_name,
+        target_username=target_username,
+        content_report=content_report,
     )
 
 
@@ -180,6 +201,11 @@ async def guard_text(message: Message, bot: Bot) -> None:
         return
 
     chat_id = message.chat.id
+
+    # SaaS gate: UNPAID / EXPIRED chats never reach the guards (CPU saving).
+    if not await subscription.is_active(chat_id):
+        return
+
     role = await rbac.get_role(chat_id, user.id)
 
     # every message becomes a potential "context" for a later reply
@@ -197,6 +223,8 @@ async def guard_text(message: Message, bot: Bot) -> None:
                 reason=kind.fa,
                 first_mute=600,
                 target_name=user.full_name,
+                target_username=user.username,
+                message_text=text,
             )
             return
 
@@ -259,9 +287,13 @@ async def guard_text(message: Message, bot: Bot) -> None:
             chat_id=chat_id,
             user_id=user.id,
             message_id=message.message_id,
-            reason=f"کلمه رکیک ({hit})",
+            reason="کلمه رکیک",
+            log_reason=f"کلمه رکیک ({hit})",
             first_mute=600,
             target_name=user.full_name,
+            target_username=user.username,
+            content_report=True,
+            message_text=text,
         )
         return
 

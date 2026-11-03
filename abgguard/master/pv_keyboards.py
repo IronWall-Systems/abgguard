@@ -111,6 +111,8 @@ def god_root_kb(has_groups: bool = False) -> InlineKeyboardMarkup:
         [_b(badge(PURPLE, "وضعیت هوش مصنوعی و دیتاست", "AI & Harvester"), "pv:god:ai")],
         [_b(badge(BLUE, "مدیریت مدیران کل", "Group Owners"), "pv:god:owners")],
         [_b(badge(BLUE, "اطلاع‌رسانی همگانی", "Global Broadcast"), "pv:god:bcast")],
+        [_b(badge(BLUE, "⚙️ مدیریت حساب‌ها و درگاه", "Payment Gateways"), "pv:god:pay")],
+        [_b(badge(GREEN, "💳 وضعیت اشتراک و تمدید", "Subscription"), "pv:substat")],
     ]
     if has_groups:
         rows.append([_b(badge(BLUE, "پنل گروه‌های من", "My Groups"), "pv:admin:groups")])
@@ -129,11 +131,9 @@ def _addbot_button(bot_username: str) -> InlineKeyboardButton | None:
 
 
 def _support_button() -> InlineKeyboardButton | None:
-    if not settings.support_url:
-        return None
     return InlineKeyboardButton(
-        text=badge(BLUE, "کانال پشتیبانی", "Support Channel"),
-        url=settings.support_url,
+        text=badge(BLUE, "💬 پشتیبانی", "Support"),
+        url=settings.support_url or "https://t.me/pyyple",
     )
 
 
@@ -143,6 +143,7 @@ def admin_root_kb(bot_username: str, has_groups: bool) -> InlineKeyboardMarkup:
         rows.append([_b(badge(BLUE, "انتخاب گروه", "Select Group"), "pv:admin:groups")])
     if (btn := _addbot_button(bot_username)) is not None:
         rows.append([btn])
+    rows.append([_b(badge(GREEN, "💳 وضعیت اشتراک و تمدید", "Subscription"), "pv:substat")])
     rows.append([_b(badge(BLUE, "راهنمای امکانات ربات", "Bot Help"), "pv:help")])
     if (sup := _support_button()) is not None:
         rows.append([sup])
@@ -160,6 +161,83 @@ def user_root_kb(bot_username: str) -> InlineKeyboardMarkup:
         rows.append([sup])
     rows += _with_webapp([])
     rows += _tail(back=None)
+    return _markup(*rows)
+
+
+# ---------------------------------------------------- public PV catalog ----
+_ADD_ADMIN_RIGHTS = (
+    "delete_messages+restrict_members+pin_messages+invite_users"
+)
+
+
+def _add_group_button(label: str, username: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text=label,
+        url=f"https://t.me/{username}?startgroup=true&admin={_ADD_ADMIN_RIGHTS}",
+    )
+
+
+def _public_support_button() -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text="💬 پشتیبانی",
+        url=settings.support_url or "https://t.me/pyyple",
+    )
+
+
+def _public_add_rows() -> list[list[InlineKeyboardButton]]:
+    master = settings.master_username or "abgguardbot"
+    worker = settings.worker_username or "ABGGUARD1BOT"
+    return [
+        [_add_group_button("➕ ۱. افزودن ربات اصلی به گروه (@abgguardbot)", master)],
+        [_add_group_button("➕ ۲. افزودن ربات نگهبان به گروه (@ABGGUARD1BOT)", worker)],
+    ]
+
+
+def _panel_entry_kb(role: Role) -> list[InlineKeyboardButton]:
+    """At most ONE panel entry: God gets the unified panel, others their panel."""
+    if role >= Role.GOD:
+        return [_b("👑 ورود به پنل مدیریت", "pv:god:home")]
+    if role >= Role.SUBADMIN:
+        return [_b("🎛 ورود به پنل مدیریت گروه‌ها", "pv:home")]
+    return []
+
+
+def public_start_kb(role: Role) -> InlineKeyboardMarkup:
+    rows = _public_add_rows()
+    rows.append([_b("📖 راهنمای کامل دستورات و امکانات", "pv:public:help")])
+    rows.append([_b("💳 خرید / تمدید اشتراک و گروه‌های من", "pv:public:mygroups")])
+    rows.append([_public_support_button()])
+    entry = _panel_entry_kb(role)
+    if entry:
+        rows.append(entry)
+    return _markup(*rows)
+
+
+def public_help_kb(role: Role) -> InlineKeyboardMarkup:
+    rows = _public_add_rows()
+    rows.append([_b("💳 خرید / تمدید اشتراک و گروه‌های من", "pv:public:mygroups")])
+    rows.append([_public_support_button()])
+    entry = _panel_entry_kb(role)
+    if entry:
+        rows.append(entry)
+    rows.append([_b(BACK_LABEL, "pv:public:start")])
+    return _markup(*rows)
+
+
+def public_mygroups_kb(
+    entries: list[tuple[int, str]], role: Role, back: str = "pv:public:start"
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for chat_id, title in entries:
+        label = f"💳 {title[:38]}"
+        rows.append([_b(label, f"pv:public:pay:{chat_id}")])
+    if not entries:
+        rows += _public_add_rows()
+    rows.append([_b(BACK_LABEL, back)])
+    rows.append([_public_support_button()])
+    entry = _panel_entry_kb(role)
+    if entry:
+        rows.append(entry)
     return _markup(*rows)
 
 
@@ -191,10 +269,51 @@ def god_owners_kb(owners: list[tuple[int, int, str]], back: str = "pv:root") -> 
     return _markup(*rows)
 
 
+def god_payment_kb(methods: list) -> InlineKeyboardMarkup:
+    """⚙️ مدیریت حساب‌ها و درگاه - add / toggle / delete with one click."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for m in methods[:20]:
+        mark = "🟢" if m.is_active else "⚪️"
+        label = f"{mark} {m.title[:18]} | {m.value[:22]}"
+        rows.append([
+            InlineKeyboardButton(
+                text=label[:64], callback_data=f"pv:god:pay:tgl:{m.id}"
+            ),
+            _b("🗑 حذف", f"pv:god:pay:del:{m.id}"),
+        ])
+    rows.append([
+        _b(badge(BLUE, "افزودن روش پرداخت (کارت/ولت)", "Add Method"), "pv:god:pay:add")
+    ])
+    rows += _tail(back="pv:root")
+    return _markup(*rows)
+
+
+def god_payment_add_kb() -> InlineKeyboardMarkup:
+    """Step 1 of the add flow - pick the gateway type."""
+    return _markup(
+        [_b(badge(GREEN, "💳 شماره کارت بانکی", "Bank Card"), "pv:god:pay:pt:card")],
+        [_b(badge(PURPLE, "🪙 ولت ارز دیجیتال", "Crypto Wallet"), "pv:god:pay:pt:crypto")],
+        *_tail(back="pv:god:pay"),
+    )
+
+
+def god_payment_post_kb() -> InlineKeyboardMarkup:
+    """Between-steps screen for the add flow (no action while typing)."""
+    return _markup(*_tail(back="pv:god:pay"))
+
+
 def owner_detail_kb(user_id: int, chat_id: int) -> InlineKeyboardMarkup:
     return _markup(
+        [_b(badge(GREEN, "فعال‌سازی دستی اشتراک ۳۰ روزه", "Activate 30 Days"),
+            f"pv:god:sub:pay:{chat_id}")],
+        [_b(badge(PURPLE, "ثبت دستی گروه (بدون پرداخت)", "Manual Whitelist"),
+            f"pv:god:sub:man:{chat_id}")],
+        [_b(badge(BLUE, "تغییر / افزودن مالک گروه", "Change Owner"),
+            f"pv:god:ow:new:{chat_id}")],
         [_b(badge(RED, "ابطال دسترسی مدیر گروه", "Revoke Owner"),
             f"pv:god:ow:del:{user_id}:{chat_id}")],
+        [_b(badge(RED, "حذف کامل گروه", "Remove Group"),
+            f"pv:god:ow:rm:{chat_id}")],
         *_tail(back="pv:god:owners"),
     )
 

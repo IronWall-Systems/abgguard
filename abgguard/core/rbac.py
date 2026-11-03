@@ -183,6 +183,14 @@ async def list_owner_bindings() -> list[tuple[int, int]]:
     return sorted((int(c), int(u)) for c, u in rows)
 
 
+async def list_owner_ids(chat_id: int) -> list[int]:
+    """Durable Level 2 roster for one chat (PostgreSQL, not the Redis mirror)."""
+    rows = await RoleBinding.filter(
+        chat_id=chat_id, role=RoleBinding.ADMIN
+    ).values_list("user_id", flat=True)
+    return sorted(int(u) for u in rows)
+
+
 async def list_gods() -> list[int]:
     return sorted(int(m) for m in await rk.get_redis().smembers(rk.RBAC_GOD))
 

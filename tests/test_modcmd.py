@@ -17,7 +17,9 @@ def test_slash_aliases_resolve_to_one_canonical_action() -> None:
         "/اخطار 10": "warn",
         "/purge": "purge",
         "/purge 50": "purge",
-        "/پاکسازی": "purge",
+        "/wipe": "wipe",
+        "/wipeall": "wipe_all",
+        "/پاکسازی": "wipe",
         "/unmute": "unmute",
         "/UNMUTE 99": "unmute",
     }
@@ -49,7 +51,16 @@ def test_persian_triggers_only_match_as_a_whole_message() -> None:
 
 
 def test_rule_six_triggers_are_supported() -> None:
-    assert {"سکوت", "اخطار"} == modcmd.PLAIN_TRIGGERS
+    assert {"سکوت", "اخطار", "پاکسازی", "wipe"} == modcmd.PLAIN_TRIGGERS
+
+
+def test_full_wipe_triggers_are_exact() -> None:
+    assert modcmd.parse_mod_command("پاکسازی همه") == ("wipe_all", "")
+    assert modcmd.parse_mod_command("wipe all") == ("wipe_all", "")
+    assert modcmd.parse_mod_command("/wipeall") == ("wipe_all", "")
+    assert modcmd.is_plain_trigger("پاکسازی همه")
+    assert modcmd.is_plain_trigger("wipe all")
+    assert not modcmd.is_plain_trigger("پاکسازی همه چیز")
 
 
 def test_the_unmute_bare_triggers_are_supported() -> None:

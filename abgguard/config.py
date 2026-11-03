@@ -25,6 +25,15 @@ def _env(name: str, default: str | None = None) -> str | None:
     return raw if raw else default
 
 
+def _first_env(*names: str, default: str | None = None) -> str | None:
+    """First non-empty variable among aliases (e.g. ABG_BOT_TOKEN/MASTER_BOT_TOKEN)."""
+    for name in names:
+        value = _env(name)
+        if value:
+            return value
+    return default
+
+
 def _csv_ints(raw: str | None) -> tuple[int, ...]:
     if not raw:
         return ()
@@ -34,6 +43,30 @@ def _csv_ints(raw: str | None) -> tuple[int, ...]:
         if chunk.isdigit() or (chunk.startswith("-") and chunk[1:].isdigit()):
             out.append(int(chunk))
     return tuple(out)
+
+
+def _porn_api_url() -> str:
+    raw = _first_env(
+        "PORN_API_URL", "PORNSCAN_URL", default="http://127.0.0.1:8010/detect"
+    )
+    assert raw is not None
+    raw = raw.strip().rstrip("/")
+    return raw if raw.endswith("/detect") else f"{raw}/detect"
+
+
+def _bot_api_base() -> str:
+    """Local Bot API server base URL; empty string falls back to the cloud API."""
+    raw = _first_env(
+        "TELEGRAM_BOT_API_URL",
+        "LOCAL_BOT_API_URL",
+        "BOT_API_URL",
+        default="http://127.0.0.1:8081",
+    )
+    assert raw is not None
+    raw = raw.strip().rstrip("/")
+    if raw.lower() in {"off", "cloud", "none", "disabled"}:
+        return ""
+    return raw
 
 
 def _f(name: str, default: float) -> float:
@@ -129,24 +162,61 @@ class Settings:
     captcha_timeout: int = 60
     broadcast_delay: float = 0.05
 
+    # Local Telegram Bot API server (enables >48h deletions / bulk purge).
+    # Set TELEGRAM_BOT_API_URL=off to fall back to the cloud API.
+    bot_api_base: str = "http://127.0.0.1:8081"
+
+    # SaaS subscription engine
+    price_toman: int = 750_000
+    price_usd: int = 3
+    cycle_days: int = 30
+    trial_hours: int = 24
+    trial_min_members: int = 50
+    warn_days: tuple[int, ...] = (3, 2, 1)
+    payment_card_number: str = ""
+    payment_card_holder: str = ""
+    payment_crypto_address: str = ""
+
+    # dual-bot distributed fallback (master heartbeat, worker watchdog)
+    master_username: str = "abgguardbot"
+    worker_username: str = "ABGGUARD1BOT"
+    heartbeat_ttl: int = 45
+    heartbeat_interval: int = 15
+
     redis_prefix: str = field(default="abg")
+
+    @property
+    def god_admin_id(self) -> int:
+        """Primary Level 3 recipient (receipts, approvals, private mod-log).
+
+        The Master bot talks to this id only; the worker/media bot never
+        forwards admin notifications.
+        """
+        return self.god_admin_ids[0] if self.god_admin_ids else FALLBACK_GOD_ADMIN_ID
 
     @classmethod
     def from_env(cls) -> Settings:
+        master_token = _first_env("MASTER_BOT_TOKEN", "ABG_BOT_TOKEN")
+        worker_token = _first_env("WORKER_BOT_TOKEN")
         missing = [
-            k for k in ("MASTER_BOT_TOKEN", "WORKER_BOT_TOKEN") if not _env(k)
+            name
+            for name, value in (
+                ("ABG_BOT_TOKEN/MASTER_BOT_TOKEN", master_token),
+                ("WORKER_BOT_TOKEN", worker_token),
+            )
+            if not value
         ]
         if missing:
             raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
         return cls(
-            master_token=str(_env("MASTER_BOT_TOKEN")),
-            worker_token=str(_env("WORKER_BOT_TOKEN")),
+            master_token=str(master_token),
+            worker_token=str(worker_token),
             god_admin_ids=_god_admin_ids(),
             postgres_dsn=_postgres_dsn(),
             redis_dsn=_redis_dsn(),
-            porn_api_url=_env("PORN_API_URL", "http://127.0.0.1:8010/detect"),  # type: ignore[arg-type]
-            porn_api_timeout=_f("PORN_API_TIMEOUT", 6.0),
+            porn_api_url=_porn_api_url(),
+            porn_api_timeout=_f("PORN_API_TIMEOUT", 30.0),
             porn_threshold=_f("PORN_THRESHOLD", 0.55),
             dataset_dir=Path(_env("DATASET_DIR", "./dataset")),  # type: ignore[arg-type]
             dataset_file=Path(_env("DATASET_FILE", "./data/genz_corpus.jsonl")),  # type: ignore[arg-type]
@@ -168,6 +238,20 @@ class Settings:
             support_url=str(_env("SUPPORT_CHANNEL_URL", "")).rstrip("/"),
             captcha_timeout=_i("CAPTCHA_TIMEOUT", 60),
             broadcast_delay=_f("BROADCAST_DELAY", 0.05),
+            bot_api_base=_bot_api_base(),
+            price_toman=_i("PRICE_TOMAN", 750_000),
+            price_usd=_i("PRICE_USD", 3),
+            cycle_days=_i("CYCLE_DAYS", 30),
+            trial_hours=_i("TRIAL_HOURS", 24),
+            trial_min_members=_i("TRIAL_MIN_MEMBERS", 50),
+            warn_days=_csv_ints(_env("WARN_DAYS")) or (3, 2, 1),
+            payment_card_number=str(_env("PAYMENT_CARD_NUMBER") or ""),
+            payment_card_holder=str(_env("PAYMENT_CARD_HOLDER") or ""),
+            payment_crypto_address=str(_env("PAYMENT_CRYPTO_ADDRESS") or ""),
+            master_username=str(_env("MASTER_USERNAME") or "abgguardbot").lstrip("@"),
+            worker_username=str(_env("WORKER_USERNAME") or "ABGGUARD1BOT").lstrip("@"),
+            heartbeat_ttl=_i("HEARTBEAT_TTL", 45),
+            heartbeat_interval=_i("HEARTBEAT_INTERVAL", 15),
         )
 
 

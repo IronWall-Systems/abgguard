@@ -3,6 +3,9 @@ services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
+    # loopback publishing: the bot now runs natively on the host (systemd)
+    ports:
+      - "127.0.0.1:5432:5432"
     deploy:
       resources:
         limits:
@@ -25,6 +28,9 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # loopback publishing for the natively-running host bot
+    ports:
+      - "127.0.0.1:6379:6379"
     deploy:
       resources:
         limits:

@@ -9,7 +9,11 @@ from abgguard.config import settings
 
 log = logging.getLogger("abgguard.antiporn")
 
-_TIMEOUT = aiohttp.ClientTimeout(total=settings.porn_api_timeout)
+_TIMEOUT = aiohttp.ClientTimeout(
+    total=settings.porn_api_timeout,
+    connect=5.0,
+    sock_read=settings.porn_api_timeout,
+)
 
 
 @dataclass(slots=True)
@@ -77,7 +81,7 @@ class AntiPornClient:
                 data = await resp.json(content_type=None)
         except Exception as exc:
             # fail-open: a dead detector must never freeze the worker
-            log.warning("porn api unreachable: %s", exc)
+            log.warning("porn api unreachable: %s: %s", type(exc).__name__, exc)
             return PornVerdict(available=False)
 
         score = float(data.get("score", 0.0))

@@ -63,6 +63,7 @@ def panel_kb(
         InlineKeyboardButton(
             text=f"🏷 نام فراخوانی ربات: {trigger}"[:64], callback_data="abg:trg"
         ),
+        InlineKeyboardButton(text="💳 وضعیت اشتراک و تمدید", callback_data="abg:sub"),
         InlineKeyboardButton(text="🔄 بروزرسانی", callback_data="abg:refresh"),
         InlineKeyboardButton(text="❓ راهنما", callback_data="abg:help"),
     ]
