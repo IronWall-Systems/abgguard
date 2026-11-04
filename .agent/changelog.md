@@ -33,8 +33,6 @@
 - Zero-disk retention: every archive is shipped to the God Admin's private chat as a document; wiped from local disk only after Telegram confirms upload. Failed uploads keep the file and notify the God Admin.
 - God Admin manual trigger: `rotate_now()` backs the PV button `[🟣 تخلیه دستی و فشرده‌سازی]` for on-demand ZIP rotation and delivery.
 
-- God Admin manual trigger: `rotate_now()` backs the PV button `[🟣 تخلیه دستی و فشرده‌سازی]` for on-demand ZIP rotation and delivery.
-
 ### 24-Hour Redis Escalating Strike System (`core/redis.py`, `master/handlers/guards.py`)
 - New `k_strike(chat_id, user_id)` key (`abg:strikes:{chat_id}:{user_id}`) with 86400s (24h) TTL.
 - On every profanity/NSFW violation: message is always deleted immediately, then the strike counter is incremented.
@@ -83,3 +81,16 @@
 - `log.debug()` statements for each chunk processed; `TelegramBadRequest` and `TelegramForbiddenError` explicitly logged with chat_id and message_id.
 - Fallback to one-by-one `bot.delete_message()` when `delete_messages()` chunk fails.
 - Success message: `"✅ تاریخچه گروه با موفقیت پاک‌سازی شد.\n🗑 تعداد: {deleted_count} پیام\n⏱ زمان عملیات: {elapsed} ثانیه"` auto-deletes after 15 seconds.
+
+## 2026-11-04 — Bug Fix: Accurate Deletion Counting & Creator Immunity
+
+### Wipe All Counter Fix (`master/handlers/modcmd.py`)
+- `_do_wipe_all` now iterates one-by-one instead of trusting `delete_messages()` return value (Telegram can return `True` even when admin messages cannot be deleted).
+- `deleted_count` is only incremented after a successful `await bot.delete_message()` — not before.
+- `skipped_count` tracks messages that could not be deleted (admin immunity, not found, etc.) and is reported in the final notice.
+- `TelegramBadRequest` and `TelegramForbiddenError` are explicitly logged per message_id.
+
+### Moderation Deletion Validation (`services/moderation.py`)
+- `delete_and_mute()` and `delete_and_ban()` now check the return value of `safe_delete()`.
+- If deletion fails (e.g., creator/admin immunity), the public notice is suppressed to avoid falsely claiming the message was removed.
+- The sanction (mute/ban) is still applied, but a warning is logged instead of sending a misleading public message.

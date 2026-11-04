@@ -394,9 +394,20 @@ async def delete_and_ban(
     bans: `handle_ban_event()` resolves a ban-worthy reason into a permanent
     mute plus a private Level 2 escalation. Pass ``reason="permamute:..."`` to
     make the intent explicit, or a plain reason for the strike-ceiling path.
+
+    If the message cannot be deleted (e.g., admin/creator immunity), the
+    sanction is still applied but the public notice is suppressed to avoid
+    falsely claiming the message was removed.
     """
+    deleted = True
     if message_id:
-        await safe_delete(bot, chat_id, message_id)
+        deleted = await safe_delete(bot, chat_id, message_id)
+        if not deleted:
+            log.warning(
+                "delete_and_ban: could not delete msg_id=%s chat=%s user=%s "
+                "(likely admin/creator immunity)",
+                message_id, chat_id, user_id,
+            )
     await publish_ban_event(
         chat_id=chat_id,
         user_id=user_id,
@@ -411,7 +422,7 @@ async def delete_and_ban(
     )
     # The Master bot's dedicated Redis subscriber applies the sanction -
     # both the Worker and the Master funnel through the very same event bus.
-    if notify:
+    if notify and deleted:
         try:
             await bot.send_message(chat_id, redact_public_reason(notify))
         except Exception:
@@ -432,8 +443,15 @@ async def delete_and_mute(
     target_username: str | None = None,
     content_report: bool = False,
 ) -> None:
+    deleted = True
     if message_id:
-        await safe_delete(bot, chat_id, message_id)
+        deleted = await safe_delete(bot, chat_id, message_id)
+        if not deleted:
+            log.warning(
+                "delete_and_mute: could not delete msg_id=%s chat=%s user=%s "
+                "(likely admin/creator immunity)",
+                message_id, chat_id, user_id,
+            )
     await mute(bot, chat_id, user_id, seconds)
     await publish_ban_event(
         chat_id=chat_id,
