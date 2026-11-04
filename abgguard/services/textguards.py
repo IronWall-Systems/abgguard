@@ -273,9 +273,14 @@ def _build_profanity_regex(bad_words: set[str]) -> re.Pattern:
     between letters.  Keeps CPU/RAM minimal - one pass over the text."""
     patterns = []
     for word in bad_words:
+        # Ignore spaces inside phrases: the separator between letters is
+        # already \W*, so "کص ننت" must also match "کص.ننت" and "کص  ننت".
+        letters = [char for char in word if not char.isspace()]
+        if not letters:
+            continue
         # For each letter, require at least one occurrence (+),
         # separated by optional non-word characters (\W*) like spaces, dots, ZWNJ.
-        pattern_body = r"\W*".join(re.escape(char) + r"+" for char in word)
+        pattern_body = r"\W*".join(re.escape(char) + r"+" for char in letters)
         # Lookbehind/lookahead enforce word boundaries so ``عکس`` does not
         # match ``کس`` and ``تخمه`` does not match ``تخم``.
         patterns.append(rf"(?<!\w){pattern_body}(?!\w)")

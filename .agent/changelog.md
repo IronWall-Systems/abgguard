@@ -1,5 +1,32 @@
 # Agent Changelog
 
+## 2026-11-04 — Moderation Pipeline Repair (Profanity + NSFW)
+
+### Profanity Filter Root Cause
+- `master/handlers/modcmd.py` ended with a catch-all `@router.message()` before
+  `guards.router` was mounted. It matched every group text message and returned
+  `None`, so aiogram stopped propagation and the text guards never ran.
+- Replaced the catch-all with `RoleCommandTrigger`, which matches only the
+  hierarchical promotion/demotion commands (`نصب معاون`, `عزل معاون`, ...).
+  Ordinary text now continues to `master.guards.guard_text`.
+- `services/textguards.py` now ignores spaces inside blacklist phrases when
+  building `PROFANITY_REGEX`, so `کص ننت` also matches `کص.ننت` and `کص  ننت`.
+
+### NSFW Download Fix (Local Bot API)
+- Local Bot API `getFile` returns absolute container paths such as
+  `/var/lib/telegram-bot-api/<token>/photos/file_1.jpg`. Building an HTTP
+  `/file/bot...` URL from that path returned `404`, so every media scan failed
+  open and no porn was detected.
+- `core/botapi.py` now creates the session with `is_local=True` and
+  `SimpleFilesPathWrapper`, mapping the container path to the host bind mount
+  before reading the file directly. No HTTP file endpoint is used in local mode.
+- Added `TELEGRAM_BOT_API_SERVER_DIR` and `TELEGRAM_BOT_API_DATA_DIR` settings
+  (defaults: `/var/lib/telegram-bot-api` and
+  `/opt/dailydev-telegram-bot/telegram-bot-api-data`) and documented them in
+  `.env.example`.
+- `services/media_guard.py` now logs the exception type, chat/message/kind and
+  traceback when a download fails instead of a one-line warning.
+
 ## 2026-11-03 — Profanity Filter & ModLog Workflow Improvements
 
 ### Profanity Filter (Scunthorpe Problem Fix)

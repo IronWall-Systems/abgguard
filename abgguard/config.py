@@ -165,6 +165,11 @@ class Settings:
     # Local Telegram Bot API server (enables >48h deletions / bulk purge).
     # Set TELEGRAM_BOT_API_URL=off to fall back to the cloud API.
     bot_api_base: str = "http://127.0.0.1:8081"
+    # Paths used to read media files directly in --local mode.  The server
+    # reports container paths under bot_api_server_dir; the bot maps them to
+    # the host bind mount in bot_api_data_dir before downloading.
+    bot_api_server_dir: Path = Path("/var/lib/telegram-bot-api")
+    bot_api_data_dir: Path = Path("/opt/dailydev-telegram-bot/telegram-bot-api-data")
 
     # SaaS subscription engine
     price_toman: int = 750_000
@@ -239,6 +244,15 @@ class Settings:
             captcha_timeout=_i("CAPTCHA_TIMEOUT", 60),
             broadcast_delay=_f("BROADCAST_DELAY", 0.05),
             bot_api_base=_bot_api_base(),
+            bot_api_server_dir=Path(
+                _env("TELEGRAM_BOT_API_SERVER_DIR", "/var/lib/telegram-bot-api")
+            ),
+            bot_api_data_dir=Path(
+                _env(
+                    "TELEGRAM_BOT_API_DATA_DIR",
+                    "/opt/dailydev-telegram-bot/telegram-bot-api-data",
+                )
+            ),
             price_toman=_i("PRICE_TOMAN", 750_000),
             price_usd=_i("PRICE_USD", 3),
             cycle_days=_i("CYCLE_DAYS", 30),

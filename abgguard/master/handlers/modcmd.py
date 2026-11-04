@@ -262,6 +262,19 @@ class ModTrigger(Filter):
         return await rbac.get_role(chat.id, user.id) >= Role.SUBADMIN
 
 
+class RoleCommandTrigger(Filter):
+    """Matches only the hierarchical promotion/demotion commands.
+
+    The old router-level catch-all swallowed every group text message before
+    ``guards.router`` could see it, which silently disabled the profanity,
+    link, emoji and forward filters.  This filter keeps the role commands in
+    this router while letting ordinary text continue to the guards.
+    """
+
+    async def __call__(self, message: Message) -> bool:
+        return _parse_role_command(message.text) is not None
+
+
 class VipTrigger(Filter):
     """
     Matches a *reply* carrying a VIP trigger, written by staff only (Level 1-3).
@@ -991,7 +1004,7 @@ async def _do_promote(
     )
 
 
-@router.message()
+@router.message(RoleCommandTrigger())
 async def on_role_command(message: Message, bot: Bot) -> None:
     """Handle promotion/demotion commands (نصب/عزل معاون, ارشد چت, ...)."""
     parsed = _parse_role_command(message.text)

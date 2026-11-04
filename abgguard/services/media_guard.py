@@ -90,7 +90,15 @@ async def scan_media(bot: Bot, message: Message) -> tuple[bool, float]:
     try:
         stream = await bot.download(source, destination=None)
     except Exception as exc:
-        log.warning("download failed chat=%s: %s", message.chat.id, exc)
+        log.warning(
+            "download failed chat=%s msg=%s kind=%s: %s: %s",
+            message.chat.id,
+            message.message_id,
+            kind,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
         return False, 0.0
     if stream is None:
         return False, 0.0
