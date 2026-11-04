@@ -33,6 +33,8 @@
 - Zero-disk retention: every archive is shipped to the God Admin's private chat as a document; wiped from local disk only after Telegram confirms upload. Failed uploads keep the file and notify the God Admin.
 - God Admin manual trigger: `rotate_now()` backs the PV button `[🟣 تخلیه دستی و فشرده‌سازی]` for on-demand ZIP rotation and delivery.
 
+- God Admin manual trigger: `rotate_now()` backs the PV button `[🟣 تخلیه دستی و فشرده‌سازی]` for on-demand ZIP rotation and delivery.
+
 ### 24-Hour Redis Escalating Strike System (`core/redis.py`, `master/handlers/guards.py`)
 - New `k_strike(chat_id, user_id)` key (`abg:strikes:{chat_id}:{user_id}`) with 86400s (24h) TTL.
 - On every profanity/NSFW violation: message is always deleted immediately, then the strike counter is incremented.
@@ -66,12 +68,18 @@
 - `سکوت X` (e.g., `سکوت 1`, `سکوت 5`) -> X hours (X * 3600s).
 - Uses `bot.restrict_chat_member(chat_id, user_id, until_date=time.time() + duration)`.
 
-## 2026-11-03 — WIPE ALL Debug & Execution Timer
+## 2026-11-04 — Wipe All Debug & Execution Timer
 
-### Wipe All Fix (`master/handlers/modcmd.py`)
-- Rewrote `_do_wipe_all()` to iterate backward from `message_id` down to `max(1, current_id - 10000)` in chunks of 99.
-- Added `time.time()` timer with elapsed time reported in the success notice.
-- Added `log.debug()` statements for every chunk processed and every `TelegramBadRequest` exception so the exact failure reason is visible in the terminal.
-- Fallback: if `delete_messages()` chunk fails, iterates per-message with `bot.delete_message()` and `await asyncio.sleep(0.05)` to avoid FloodWait.
-- Success notice: `"✅ تاریخچه گروه با موفقیت پاک‌سازی شد.\n🗑 تعداد: {deleted_count} پیام\n⏱ زمان عملیات: {elapsed} ثانیه"` auto-deletes after 15 seconds.
-- Local Bot API routing confirmed: `core/botapi.py` `make_session()` returns `AiohttpSession(api=TelegramAPIServer.from_base("http://127.0.0.1:8081"))`, bypassing the 48-hour cloud API deletion limit.
+### Local API Connection Verified
+- `core/botapi.py` `make_session()` returns `AiohttpSession(api=TelegramAPIServer.from_base("http://127.0.0.1:8081"))` — all Bot API calls route through the local server, bypassing the 48-hour cloud restriction.
+- `master/bot.py` `create_master()` passes `session=make_session()` to `Bot()`.
+
+### Wipe All Rewrite (`master/handlers/modcmd.py`)
+- `WIPE_ALL_DEPTH` increased from 200 to 10000 messages.
+- `WIPE_ALL_SLEEP` reduced from 0.3s to 0.05s between chunks.
+- Loop walks backward from `current_id` down to `max(1, current_id - 10000)` in chunks of 99.
+- `start_time = time.time()` timer started before the loop; `elapsed = round(time.time() - start_time, 2)` calculated after.
+- `deleted_count` counter tracks successfully deleted messages.
+- `log.debug()` statements for each chunk processed; `TelegramBadRequest` and `TelegramForbiddenError` explicitly logged with chat_id and message_id.
+- Fallback to one-by-one `bot.delete_message()` when `delete_messages()` chunk fails.
+- Success message: `"✅ تاریخچه گروه با موفقیت پاک‌سازی شد.\n🗑 تعداد: {deleted_count} پیام\n⏱ زمان عملیات: {elapsed} ثانیه"` auto-deletes after 15 seconds.
