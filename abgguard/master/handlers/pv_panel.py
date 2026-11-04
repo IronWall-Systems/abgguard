@@ -1196,6 +1196,34 @@ async def pv_admin_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> N
     await _ack(cq)
 
 
+def _admin_handle(user) -> str:
+    if getattr(user, "username", None):
+        return f"@{html.escape(user.username)}"
+    return html.escape(getattr(user, "full_name", None) or str(user.id))
+
+
+async def _mark_modlog_done(cq: CallbackQuery, outcome: str) -> None:
+    """Stamp the card and remove its keyboard so the next admin sees it handled."""
+    msg = cq.message
+    if not isinstance(msg, Message):
+        return
+    actor = cq.from_user
+    if actor is None:
+        return
+    base = (msg.text or "").rstrip()
+    marker = f"✅ انجام شد توسط {_admin_handle(actor)}"
+    if marker not in base:
+        base = f"{base}\n\n{outcome}\n{marker}" if outcome else f"{base}\n\n{marker}"
+    try:
+        await msg.edit_text(base, parse_mode="HTML", reply_markup=None)
+    except Exception as exc:
+        log.debug("modlog card update failed: %s", exc)
+        try:
+            await msg.edit_reply_markup(reply_markup=None)
+        except Exception as exc2:
+            log.debug("modlog keyboard removal failed: %s", exc2)
+
+
 @router.callback_query(F.data.startswith("modact:"))
 async def modact_callback(cq: CallbackQuery, bot: Bot) -> None:
     """Handle inline action buttons from PV ModLog cards.
@@ -1237,12 +1265,7 @@ async def modact_callback(cq: CallbackQuery, bot: Bot) -> None:
         )
         try:
             await bot.restrict_chat_member(chat_id, target_user_id, permissions=full)
-            new_text = (
-                (cq.message.text or "")
-                + "\n\nوضعیت جدید: 🔊 کاربر توسط ادمین لغو سکوت شد."
-            )
-            await cq.message.edit_text(new_text, parse_mode="HTML")
-            await cq.message.edit_reply_markup(reply_markup=None)
+            await _mark_modlog_done(cq, "🔊 سکوت کاربر لغو شد.")
             await cq.answer("سکوت کاربر لغو شد ✅")
         except Exception as exc:
             log.warning("modact unmute failed chat=%s user=%s: %s", chat_id, target_user_id, exc)
@@ -1258,12 +1281,7 @@ async def modact_callback(cq: CallbackQuery, bot: Bot) -> None:
             return
         try:
             await bot.ban_chat_member(chat_id, target_user_id)
-            new_text = (
-                (cq.message.text or "")
-                + "\n\nوضعیت جدید: ⛔️ کاربر توسط ادمین بن/اخراج شد."
-            )
-            await cq.message.edit_text(new_text, parse_mode="HTML")
-            await cq.message.edit_reply_markup(reply_markup=None)
+            await _mark_modlog_done(cq, "⛔️ کاربر اخراج شد.")
             await cq.answer("کاربر بن شد ⛔️")
         except Exception as exc:
             log.warning("modact ban failed chat=%s user=%s: %s", chat_id, target_user_id, exc)
@@ -1271,11 +1289,8 @@ async def modact_callback(cq: CallbackQuery, bot: Bot) -> None:
         return
 
     if action == "dismiss":
-        try:
-            await cq.message.edit_reply_markup(reply_markup=None)
-            await cq.answer("نادیده گرفته شد 🗑")
-        except Exception:
-            await cq.answer()
+        await _mark_modlog_done(cq, "🗑 مورد نادیده گرفته شد.")
+        await cq.answer("نادیده گرفته شد 🗑")
         return
 
     await cq.answer()

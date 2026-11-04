@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
-import re
 import time
 
 from aiogram import Bot, F, Router
@@ -14,7 +13,8 @@ from aiogram.types import ChatPermissions, Message
 from abgguard.core import hierarchy, rbac
 from abgguard.core.rbac import Role
 from abgguard.core.redis import VIP_TTL, revoke_user_vip, set_user_vip
-from abgguard.master.ephemeral import fa_num, notice
+from abgguard.master.ephemeral import delete_later, fa_num, notice, spawn
+from abgguard.master.keyboards import wipe_confirm_kb
 from abgguard.models.entities import BanLog
 from abgguard.services import moderation, modlog, strikes, subscription
 from abgguard.services.textguards import is_bot_message
@@ -39,7 +39,8 @@ async def _require_subscription(message: Message, bot: Bot) -> bool:
     return False
 
 
-DEFAULT_MUTE = 600  # 10 minutes - the same first-strike mute the guards use
+DEFAULT_MUTE = 1800  # bare «سکوت» -> 30 minutes
+WARN_MUTE = 600  # first manual warning stays 10 minutes
 MAX_MUTE = 366 * 24 * 3600
 DEFAULT_PURGE = 20
 MAX_PURGE = 100
@@ -112,6 +113,16 @@ UNMUTE_TRIGGERS = frozenset({"لغو سکوت", "حذف سکوت"})
 VIP_GRANT_WORDS = ("ویژه", "وی‌آی‌پی")
 VIP_REVOKE_WORDS = ("لغو ویژه", "لغو وی‌آی‌پی")
 
+# Organizational rank -> operational RBAC level. Senior ranks can ban, so they
+# map to Level 2; chat/call admins map to Level 1 (mute/warn only).
+HIERARCHY_OPERATIONAL_LEVEL: dict[str, Role] = {
+    hierarchy.Role.DEPUTY: Role.ADMIN,
+    hierarchy.Role.SENIOR_CHAT: Role.ADMIN,
+    hierarchy.Role.SENIOR_CALL: Role.ADMIN,
+    hierarchy.Role.ADMIN_CHAT: Role.SUBADMIN,
+    hierarchy.Role.ADMIN_CALL: Role.SUBADMIN,
+}
+
 # Reply-driven silent cleanup: an admin answers a message with exactly one of
 # these two words and both messages disappear - no warning, no mute and no
 # confirmation notice (Clean Chat Protocol, §6). "حذف سکوت" is a different,
@@ -119,9 +130,6 @@ VIP_REVOKE_WORDS = ("لغو ویژه", "لغو وی‌آی‌پی")
 REMOVE_TRIGGERS = frozenset({"remove", "حذف"})
 PIN_TRIGGERS = frozenset({"pin", "پین"})
 UNPIN_TRIGGERS = frozenset({"unpin", "حذف پین"})
-
-_DURATION_RE = re.compile(r"^(\d+)\s*([smhd]?)$", re.IGNORECASE)
-
 
 # ------------------------------------------------------------------ parsing --
 def vip_action(text: str | None) -> str | None:
@@ -186,19 +194,21 @@ def parse_mod_command(text: str | None) -> tuple[str, str] | None:
     return None
 
 
-def parse_duration(raw: str, default: int = DEFAULT_MUTE) -> int:
-    """``"30"`` -> 1800s (minutes), ``"2h"`` -> 7200s, ``"45s"`` -> 45s."""
+def parse_mute_seconds(raw: str) -> int | None:
+    """Strict mute parser: empty -> 30 min; ``X`` -> exactly X hours.
+
+    Anything other than a positive integer is rejected so ``/mute 30`` can
+    never silently mean 30 minutes when the product contract says hours.
+    """
     token = (raw or "").strip().split(maxsplit=1)
     if not token:
-        return default
-    hit = _DURATION_RE.fullmatch(token[0])
-    if hit is None:
-        return default
-    amount = int(hit.group(1))
-    if amount == 0:
-        return default
-    factor = {"": 60, "s": 1, "m": 60, "h": 3600, "d": 86400}[hit.group(2).lower()]
-    return min(amount * factor, MAX_MUTE)
+        return DEFAULT_MUTE
+    if not token[0].isdigit():
+        return None
+    hours = int(token[0])
+    if hours <= 0:
+        return None
+    return min(hours * 3600, MAX_MUTE)
 
 
 def parse_count(raw: str, default: int = DEFAULT_PURGE, maximum: int = MAX_PURGE) -> int:
@@ -209,14 +219,12 @@ def parse_count(raw: str, default: int = DEFAULT_PURGE, maximum: int = MAX_PURGE
 
 
 def resolve_target(reply_user_id: int | None, args: str) -> tuple[int | None, str]:
-    """``(target_id, remaining_args)`` - reply wins over a raw user id."""
-    rest = (args or "").strip()
-    if reply_user_id is not None:
-        return reply_user_id, rest
-    parts = rest.split()
-    if parts and parts[0].isdigit() and int(parts[0]) > 0:
-        return int(parts[0]), " ".join(parts[1:])
-    return None, rest
+    """Resolve a moderation target **only** from the replied-to message.
+
+    A raw number is deliberately not treated as a user id: ``/mute 30`` must
+    mean "30 hours" (with a reply), never "user id 30".
+    """
+    return reply_user_id, (args or "").strip()
 
 
 def humanize(seconds: int) -> str:
@@ -407,16 +415,15 @@ async def _do_mute(message: Message, bot, target: int, args: str) -> None:
         await notice(message, "❌ شما مجوز سکوت کردن ندارید.", delay=7.0)
         return
 
-    # Parse duration: bare 'سکوت' -> 30 min; 'سکوت X' -> X hours
-    raw = (args or "").strip()
-    if not raw:
-        seconds = 1800  # 30 minutes default
-    else:
-        try:
-            hours = int(raw)
-            seconds = 1800 if hours <= 0 else hours * 3600
-        except ValueError:
-            seconds = 1800
+    # Parse duration: bare 'سکوت' -> 30 min; 'سکوت X' -> exactly X hours.
+    seconds = parse_mute_seconds(args)
+    if seconds is None:
+        await notice(
+            message,
+            "❌ مدت سکوت باید عدد صحیح ساعت باشد. مثال: <code>سکوت 2</code>",
+            delay=7.0,
+        )
+        return
 
     if not await moderation.mute(bot, chat_id, target, seconds):
         await notice(message, "❌ سکوت اعمال نشد؛ سطح دسترسی ربات یا وضعیت کاربر مناسب نیست.")
@@ -528,21 +535,21 @@ async def _do_warn(message: Message, bot, target: int, target_name: str | None =
     strike = await strikes.register(chat_id, target)
 
     if strike <= 1:
-        if not await moderation.mute(bot, chat_id, target, DEFAULT_MUTE):
+        if not await moderation.mute(bot, chat_id, target, WARN_MUTE):
             await notice(message, "❌ اخطار ثبت نشد؛ سطح دسترسی ربات مناسب نیست.")
             return
-        await _log_action(chat_id, target, f"mute:اخطار دستی:{DEFAULT_MUTE}s")
+        await _log_action(chat_id, target, f"mute:اخطار دستی:{WARN_MUTE}s")
         await _drop_replied(message, bot)
         await notice(
             message,
             f"⚠️ اخطار ۱ برای {_mention(target)}\n"
-            f"تا {humanize(DEFAULT_MUTE)} سکوت است؛ "
+            f"تا {humanize(WARN_MUTE)} سکوت است؛ "
             "اخطار بعدی = سکوت دائم.",
         )
         modlog.notify(
             bot,
             chat_id,
-            action=f"اخطار {strike} — سکوت {humanize(DEFAULT_MUTE)}",
+            action=f"اخطار {strike} — سکوت {humanize(WARN_MUTE)}",
             target=target,
             actor=_actor(message),
             actor_source="admin",
@@ -628,6 +635,22 @@ async def _do_wipe(message: Message, bot) -> None:
 
 WIPE_ALL_DEPTH = 10000
 WIPE_ALL_SLEEP = 0.05
+
+
+async def _ask_wipe_all(message: Message) -> None:
+    """Ask for explicit confirmation before the destructive full-history wipe."""
+    try:
+        sent = await message.answer(
+            "⚠️ پاک‌سازی همه\n\n"
+            f"این عملیات تا {fa_num(WIPE_ALL_DEPTH)} پیام اخیر را حذف می‌کند "
+            "و قابل بازگشت نیست.\n\n"
+            "آیا مطمئن هستید؟",
+            reply_markup=wipe_confirm_kb(),
+        )
+    except Exception as exc:
+        log.debug("wipe confirmation prompt failed: %s", exc)
+        return
+    spawn(delete_later(sent, 30.0), name="wipe-confirm-clean")
 
 
 async def _do_wipe_all(message: Message, bot) -> None:
@@ -751,7 +774,7 @@ async def on_mod_command(message: Message, bot: Bot) -> None:
         return
 
     if name == "wipe_all":
-        await _do_wipe_all(message, bot)
+        await _ask_wipe_all(message)
         return
 
     if name == "wipe":
@@ -769,8 +792,8 @@ async def on_mod_command(message: Message, bot: Bot) -> None:
     if target is None:
         await notice(
             message,
-            "❌ روی پیام کاربر ریپلای کنید یا شناسه عددی او را بنویسید:\n"
-            "<code>/mute 30</code> یا ریپلای + <code>/mute</code>",
+            "⚠️ لطفاً روی پیام کاربر موردنظر ریپلای کنید.",
+            delay=7.0,
         )
         return
 
@@ -946,8 +969,14 @@ async def _do_promote(
     if target_user is None:
         return
 
+    target_id = target_user.id
+    if target_id == actor.id:
+        await notice(message, "❌ نمی‌توانید مقام خودتان را تغییر دهید.", delay=7.0)
+        return
+
     actor_role = await hierarchy.get_role(chat_id, actor.id)
-    if not hierarchy.can_appoint(actor_role, target_role):
+    current_role = await hierarchy.get_role(chat_id, target_id)
+    if not hierarchy.can_appoint(actor_role, target_role, current_role):
         await notice(
             message,
             "❌ شما مجوز نصب/عزل این مقام را ندارید.",
@@ -955,15 +984,8 @@ async def _do_promote(
         )
         return
 
-    target_id = target_user.id
-
-    # Update Redis role
-    if target_role == hierarchy.Role.USER:
-        await hierarchy.remove_role(chat_id, target_id)
-    else:
-        await hierarchy.set_role(chat_id, target_id, target_role)
-
-    # Telegram permissions
+    # Telegram permissions first: a failed API call must not leave the Redis
+    # hierarchy and the operational RBAC layer out of sync.
     perms = hierarchy.permissions_for(target_role)
     try:
         await bot.promote_chat_member(
@@ -993,11 +1015,21 @@ async def _do_promote(
         except (TelegramBadRequest, TelegramForbiddenError) as exc:
             log.warning("set custom title failed: %s", exc)
 
-    await notice(
-        message,
-        "✅ کاربر به مقام منصوب شد و لقب دریافت کرد.",
-        delay=7.0,
-    )
+    # Keep the two authorization layers aligned.
+    if target_role == hierarchy.Role.USER:
+        await hierarchy.remove_role(chat_id, target_id)
+        await rbac.clear_operational_role(chat_id, target_id)
+        result = "✅ مقام کاربر حذف شد و دسترسی عملیاتی او هم‌تراز شد."
+    else:
+        await hierarchy.set_role(chat_id, target_id, target_role)
+        operational = HIERARCHY_OPERATIONAL_LEVEL.get(target_role)
+        if operational is not None:
+            await rbac.sync_operational_role(
+                chat_id, target_id, operational, granted_by=actor.id
+            )
+        result = "✅ کاربر به مقام منصوب شد، لقب و دسترسی عملیاتی دریافت کرد."
+
+    await notice(message, result, delay=7.0)
     log.info(
         "ROLE PROMOTE by %s on %s -> %s in %s",
         actor.id, target_id, target_role, chat_id,

@@ -9,13 +9,13 @@ from abgguard.models.entities import DEFAULT_TRIGGER_NAME
 
 # (field, emoji, label)
 TOGGLES: tuple[tuple[str, str, str], ...] = (
-    ("porn_lock", "🔞", "قفل هوشمند پورن"),
+    ("porn_lock", "🔞", "آنتی‌پورن"),
     ("photo_lock", "🖼", "قفل عکس"),
     ("video_lock", "🎥", "قفل ویدیو"),
-    ("emoji_lock", "😀", "قفل ایموجی"),
-    ("gif_lock", "🎞", "قفل گیف"),
     ("link_lock", "🔗", "قفل لینک"),
     ("forward_lock", "🔄", "قفل فوروارد"),
+    ("emoji_lock", "😀", "قفل ایموجی"),
+    ("gif_lock", "🎞", "قفل گیف"),
 )
 
 # Rule 6: the closer is part of the panel itself, always visible in the group
@@ -37,9 +37,13 @@ def _with_close(rows: list[list[InlineKeyboardButton]]) -> list[list[InlineKeybo
     return [*rows, [close_button()]]
 
 
-def _state(on: bool) -> str:
-    """✅ = enabled/locked   ❌ = disabled/unlocked"""
-    return "✅" if on else "❌"
+def state_label(on: bool) -> str:
+    """Human-readable lock state used by both group and PV panels."""
+    return "🟢 فعال" if on else "🔴 غیرفعال"
+
+
+def lock_label(emoji: str, label: str, on: bool) -> str:
+    return f"[{emoji} {label}: {state_label(on)}]"
 
 
 def panel_kb(
@@ -47,7 +51,7 @@ def panel_kb(
 ) -> InlineKeyboardMarkup:
     toggles = [
         InlineKeyboardButton(
-            text=f"{emoji} {label} {_state(flags.is_on(field))}",
+            text=lock_label(emoji, label, flags.is_on(field)),
             callback_data=f"abg:lock:{RKEY[field]}",
         )
         for field, emoji, label in TOGGLES
@@ -115,6 +119,18 @@ def confirm_kb(action: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="✅ بله", callback_data=f"abg:yes:{action}"),
                 InlineKeyboardButton(text="❌ خیر", callback_data="abg:back"),
+            ]
+        ]
+    )
+
+
+def wipe_confirm_kb() -> InlineKeyboardMarkup:
+    """Destructive-action guard for the full-history wipe."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="تایید ✅", callback_data="abg:wipe:yes"),
+                InlineKeyboardButton(text="انصراف ❌", callback_data="abg:wipe:no"),
             ]
         ]
     )

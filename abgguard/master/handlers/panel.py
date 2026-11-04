@@ -16,8 +16,10 @@ from abgguard.core.settings_store import INV_RKEY, GroupFlags
 from abgguard.master import ui
 from abgguard.master.ephemeral import fa_num, notice
 from abgguard.master.keyboards import (
+    TOGGLES,
     badwords_menu_kb,
     panel_kb,
+    state_label,
     subadmin_menu_kb,
     trigger_menu_kb,
 )
@@ -38,8 +40,8 @@ RBAC_REJECT = "⛔️ فقط ادمین‌ها و ساب‌ادمین‌های �
 HELP_TEXT = (
     "❓ راهنما\n\n"
     "🔵 وضعیت هر دکمه:\n"
-    "✅ = فعال / قفل\n"
-    "❌ = غیرفعال / باز\n\n"
+    "🟢 فعال = قفل روشن است\n"
+    "🔴 غیرفعال = قفل باز است\n\n"
     "🔞 پورن: اسکن محلی تصاویر توسط هوش مصنوعی\n"
     "🖼 🎥 🎞: مسدود کردن نوع رسانه\n"
     "😀 ایموجی: مسدود کردن ایموجی در متن\n"
@@ -90,17 +92,8 @@ def _panel_text(chat_id: int, role: Role, flags: GroupFlags) -> str:
         "",
         "وضعیت قفل‌ها:",
     ]
-    for field, emoji, label in (
-        ("porn_lock", "🔞", "قفل هوشمند پورن"),
-        ("photo_lock", "🖼", "قفل عکس"),
-        ("video_lock", "🎥", "قفل ویدیو"),
-        ("emoji_lock", "😀", "قفل ایموجی"),
-        ("gif_lock", "🎞", "قفل گیف"),
-        ("link_lock", "🔗", "قفل لینک"),
-        ("forward_lock", "🔄", "قفل فوروارد"),
-    ):
-        state = "✅" if flags.is_on(field) else "❌"
-        lines.append(f"{emoji} {label}: {state}")
+    for field, emoji, label in TOGGLES:
+        lines.append(f"{emoji} {label}: {state_label(flags.is_on(field))}")
     return "\n".join(lines)
 
 
@@ -321,6 +314,31 @@ async def on_panel_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> N
         return
     parts = (cq.data or "").split(":")
     action = parts[1] if len(parts) > 1 else ""
+
+    # ---- destructive full-history wipe confirmation ----------------------
+    if action == "wipe" and len(parts) > 2:
+        if msg.chat.type not in {"group", "supergroup"}:
+            await _ack(cq, "❌ این عملیات فقط در گروه قابل اجراست.", alert=True)
+            return
+        if parts[2] == "no":
+            await _ack(cq, "لغو شد")
+            try:
+                await msg.delete()
+            except Exception as exc:
+                log.debug("wipe cancel delete failed: %s", exc)
+            return
+        if parts[2] == "yes":
+            await _ack(cq, "پاک‌سازی آغاز شد")
+            try:
+                await msg.edit_text("⏳ در حال پاک‌سازی تاریخچه...", reply_markup=None)
+            except Exception as exc:
+                log.debug("wipe progress edit failed: %s", exc)
+            from abgguard.master.handlers import modcmd
+
+            await modcmd._do_wipe_all(msg, bot)
+            return
+        await _ack(cq)
+        return
 
     # ---- subscription card (step 3) --------------------------------------
     if action == "sub":

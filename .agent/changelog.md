@@ -1,5 +1,48 @@
 # Agent Changelog
 
+## 2026-11-04 — UI/UX, ModLog, RBAC Sync & Safety Optimization
+
+### Lock Panels
+- Reordered shared lock toggles to Antiporn, Photo, Video, Link, Forward, Emoji, Gif.
+- Replaced `✅`/`❌` indicators with explicit `🟢 فعال` / `🔴 غیرفعال` labels in both group and PV panels.
+- In-group and PV lock grids now render in two columns via shared `TOGGLES`, `state_label()`, and `lock_label()`.
+- PV keyboard no longer duplicates the lock-toggle list.
+
+### Destructive Wipe Confirmation
+- `/wipeall` and «پاک‌سازی همه» now show a confirmation card with «تایید ✅» / «انصراف ❌» before deleting anything.
+- The confirmation prompt auto-deletes after 30 seconds.
+- Added `abg:wipe:yes` / `abg:wipe:no` callback handling in the group panel.
+
+### Moderation Command Semantics
+- All moderation commands now require a reply to the target message; raw numeric user IDs are no longer accepted as targets.
+- Missing-target response changed to «لطفاً روی پیام کاربر موردنظر ریپلای کنید.»
+- Bare mute defaults to 30 minutes (`DEFAULT_MUTE=1800`).
+- `mute X` now means exactly X hours; non-integer or non-positive values are rejected.
+- Manual `/warn` keeps a 10-minute first-strike mute via `WARN_MUTE`.
+
+### Hierarchy ↔ Operational RBAC Sync
+- Promotion/demotion now synchronizes Telegram permissions, organizational hierarchy, and operational RBAC.
+- Added `rbac.sync_operational_role()` and `rbac.clear_operational_role()`.
+- Mapping: Deputy/Senior → Level 2 (Admin); Chat/Call Admin → Level 1 (Subadmin).
+- Promotion API calls run before Redis/RBAC writes to avoid partial state.
+- Self-promotion/demotion is rejected.
+- `GOD` can only be appointed by `GOD`; demotion compares against the target's current rank and blocks equal/higher ranks.
+
+### ModLog Cards
+- Content-violation card compacted into a linear layout with offender link, optional username, violation/strike, action, and optional message text.
+- Removed duplicate action/ID lines.
+- ModLog action buttons now append the outcome and «✅ انجام شد توسط @Admin» and remove the keyboard.
+- Dismiss now also stamps the card instead of only removing the keyboard.
+
+### NSFW Cleanup
+- `delete_and_ban()` now auto-deletes its public NSFW warning after 30 seconds, matching other public moderation notices.
+
+### Docs & Tests
+- Updated Persian help text for reply-only targets, mute semantics, wipe confirmation, and new lock states.
+- Updated `USER_MANUAL_FA.md` for the implemented behavior.
+- Updated `tests/test_modcmd.py` and `tests/test_modlog.py` for the new parser and card format.
+- `ruff check .` and `python -m compileall` pass.
+
 ## 2026-11-04 — Moderation Pipeline Repair (Profanity + NSFW)
 
 ### Profanity Filter Root Cause

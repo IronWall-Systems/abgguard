@@ -75,16 +75,14 @@ def test_the_unmute_bare_triggers_are_supported() -> None:
         assert parsed == ("unmute", ""), text
 
 
-def test_parse_duration_defaults_and_units() -> None:
-    assert modcmd.parse_duration("") == modcmd.DEFAULT_MUTE
-    assert modcmd.parse_duration("nonsense") == modcmd.DEFAULT_MUTE
-    assert modcmd.parse_duration("0") == modcmd.DEFAULT_MUTE
-    assert modcmd.parse_duration("30") == 30 * 60
-    assert modcmd.parse_duration("45s") == 45
-    assert modcmd.parse_duration("2h") == 2 * 3600
-    assert modcmd.parse_duration("1d") == 24 * 3600
-    assert modcmd.parse_duration("30 99") == 30 * 60  # only the first token counts
-    assert modcmd.parse_duration("999999d") == modcmd.MAX_MUTE
+def test_parse_mute_defaults_and_hour_units() -> None:
+    assert modcmd.parse_mute_seconds("") == modcmd.DEFAULT_MUTE
+    assert modcmd.parse_mute_seconds("nonsense") is None
+    assert modcmd.parse_mute_seconds("0") is None
+    assert modcmd.parse_mute_seconds("-2") is None
+    assert modcmd.parse_mute_seconds("2") == 2 * 3600
+    assert modcmd.parse_mute_seconds("30 99") == 30 * 3600  # first token only
+    assert modcmd.parse_mute_seconds("999999") == modcmd.MAX_MUTE
 
 
 def test_parse_count_is_clamped() -> None:
@@ -95,14 +93,14 @@ def test_parse_count_is_clamped() -> None:
     assert modcmd.parse_count("1000") == modcmd.MAX_PURGE
 
 
-def test_resolve_target_prefers_the_replied_user() -> None:
+def test_resolve_target_uses_the_replied_user() -> None:
     assert modcmd.resolve_target(42, "30") == (42, "30")
     assert modcmd.resolve_target(42, "12345 30") == (42, "12345 30")
 
 
-def test_resolve_target_falls_back_to_a_raw_user_id() -> None:
-    assert modcmd.resolve_target(None, "12345 30") == (12345, "30")
-    assert modcmd.resolve_target(None, "12345") == (12345, "")
+def test_resolve_target_never_treats_a_number_as_a_user_id() -> None:
+    assert modcmd.resolve_target(None, "12345 30") == (None, "12345 30")
+    assert modcmd.resolve_target(None, "12345") == (None, "12345")
     assert modcmd.resolve_target(None, "not-a-id 30") == (None, "not-a-id 30")
     assert modcmd.resolve_target(None, "") == (None, "")
 

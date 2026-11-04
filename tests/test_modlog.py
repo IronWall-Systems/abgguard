@@ -142,7 +142,7 @@ def test_an_unknown_source_never_falls_back_to_a_bot_label() -> None:
 
 
 # -------------------------------------------------------- content report -----
-def test_the_report_shows_the_numeric_id_and_the_action() -> None:
+def test_the_report_shows_the_compact_offender_and_action() -> None:
     text = modlog.render_report(
         group_title="My <Group>",
         target=42,
@@ -151,12 +151,11 @@ def test_the_report_shows_the_numeric_id_and_the_action() -> None:
         target_name="Ali & Co",
     )
 
-    assert "🚨 گزارش اعمال قانون (تخلف محتوا)" in text
-    assert "👥 گروه: My &lt;Group&gt;" in text
+    assert "🚨 گزارش تخلف محتوا" in text
+    assert "🏘 گروه: My &lt;Group&gt;" in text
     assert '<a href="tg://user?id=42">Ali &amp; Co</a>' in text
-    assert "🆔 آیدی عددی: <code>42</code>" in text
+    assert "⚠️ تخلف: ارسال محتوای مستهجن (Pornographic Media)" in text
     assert "⚖️ اقدام ربات: سکوت دائم (Permanent Mute)" in text
-    assert "📝 علت: ارسال محتوای مستهجن (Pornographic Media)" in text
 
 
 def test_the_report_links_the_offender_even_without_a_name() -> None:
@@ -185,7 +184,8 @@ def test_the_report_reaches_the_owner_and_the_subadmin(monkeypatch) -> None:
 
     assert sent == 2
     assert [row[0] for row in bot.sent] == [7, 9]
-    assert "🆔 آیدی عددی: <code>42</code>" in bot.sent[0][1]
+    assert "🚨 گزارش تخلف محتوا" in bot.sent[0][1]
+    assert "⚖️ اقدام ربات: سکوت دائم (Permanent Mute)" in bot.sent[0][1]
     assert bot.sent[0][2] == "HTML"
 
 

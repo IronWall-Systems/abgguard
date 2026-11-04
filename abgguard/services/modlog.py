@@ -148,24 +148,26 @@ def render_report(
     strike_count: int | None = None,
     action_taken: str | None = None,
 ) -> str:
-    """The content-violation report: names the Telegram username + numeric id."""
+    """Compact linear content-violation card for the private ModLog."""
     label = html.escape(target_name) if target_name else str(target)
-    lines = [
-        "🚨 گزارش اعمال قانون (تخلف محتوا)",
-        "",
-        f"👥 گروه: {html.escape(str(group_title))}",
-        f'👤 کاربر متخلف: <a href="tg://user?id={target}">{label}</a>',
-        f"🔗 آیدی تلگرام: {_username_line(target_username)}",
-        f"🆔 آیدی عددی: <code>{target}</code>",
-        f"⚖️ اقدام ربات: {html.escape(action)}",
-        f"📝 علت: {html.escape(reason)}",
-    ]
+    offender = f'<a href="tg://user?id={target}">{label}</a>'
+    if target_username:
+        offender += f" ({_username_line(target_username)})"
+
+    violation = html.escape(reason)
     if strike_count is not None:
-        lines.append(f"⚠️ تعداد تخلف امروز: {strike_count}")
-    if action_taken:
-        lines.append(f"⚖️ اقدام ربات: {html.escape(action_taken)}")
+        violation += f" (تخلف شماره {strike_count})"
+
+    lines = [
+        "🚨 گزارش تخلف محتوا",
+        "",
+        f"🏘 گروه: {html.escape(str(group_title))}",
+        f"👤 متخلف: {offender}",
+        f"⚠️ تخلف: {violation}",
+        f"⚖️ اقدام ربات: {html.escape(action_taken or action)}",
+    ]
     if message_text:
-        lines.append(f"💬 متن اصلی پیام: {html.escape(message_text)}")
+        lines.append(f'💬 متن: "{html.escape(message_text)}"')
     return "\n".join(lines)
 
 

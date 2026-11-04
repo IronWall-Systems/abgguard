@@ -5,6 +5,8 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from abgguard.config import settings
 from abgguard.core.rbac import Role
 from abgguard.core.settings_store import RKEY, GroupFlags, GroupPolicyFlags
+from abgguard.master.keyboards import TOGGLES as LOCK_TOGGLES
+from abgguard.master.keyboards import lock_label
 from abgguard.models.entities import DEFAULT_TRIGGER_NAME
 
 # ---------------------------------------------------------------------------
@@ -27,18 +29,6 @@ WORD_BUDGET = 30
 
 CLOSE_LABEL = f"[{CLOSE} بستن پنل | Close]"
 BACK_LABEL = f"[{BACK} بازگشت | Back]"
-
-# (field, emoji, persian label) - same set as the in-group panel
-LOCK_TOGGLES: tuple[tuple[str, str, str], ...] = (
-    ("photo_lock", "🖼", "قفل عکس"),
-    ("video_lock", "🎥", "قفل ویدیو"),
-    ("link_lock", "🔗", "قفل لینک"),
-    ("forward_lock", "🔄", "قفل فوروارد"),
-    ("emoji_lock", "😀", "قفل ایموجی"),
-    ("gif_lock", "🎞", "قفل گیف"),
-    ("porn_lock", "🔞", "آنتی‌پورن هوشمند"),
-)
-
 
 def badge(emoji: str, fa: str, en: str | None = None) -> str:
     return f"[{emoji} {fa} | {en}]" if en else f"[{emoji} {fa}]"
@@ -74,6 +64,12 @@ def _b(text: str, data: str) -> InlineKeyboardButton:
 
 def _markup(*rows: list[InlineKeyboardButton]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[list(row) for row in rows if row])
+
+
+def _grid(
+    buttons: list[InlineKeyboardButton], per_row: int = 2
+) -> list[list[InlineKeyboardButton]]:
+    return [buttons[i : i + per_row] for i in range(0, len(buttons), per_row)]
 
 
 def _tail(back: str | None = None, close: bool = True) -> list[InlineKeyboardButton]:
@@ -354,10 +350,14 @@ def group_panel_kb(
     chat_id: int, flags: GroupFlags, role: Role, trigger: str = DEFAULT_TRIGGER_NAME
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    for field, emoji, label in LOCK_TOGGLES:
-        on = flags.is_on(field)
-        text = f"{emoji} {badge(GREEN if on else RED, label)}"
-        rows.append([_b(text, f"pv:admin:lock:{chat_id}:{RKEY[field]}")])
+    toggles = [
+        _b(
+            lock_label(emoji, label, flags.is_on(field)),
+            f"pv:admin:lock:{chat_id}:{RKEY[field]}",
+        )
+        for field, emoji, label in LOCK_TOGGLES
+    ]
+    rows.extend(_grid(toggles))
     rows.append([
         _b(badge(BLUE, "کلمات ممنوعه", "Blacklist"), f"pv:admin:w:{chat_id}"),
         _b(badge(YELLOW, "لاگ‌ها و آمار", "Logs & Stats"), f"pv:admin:logs:{chat_id}"),

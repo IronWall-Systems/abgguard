@@ -273,3 +273,60 @@ async def remove_subadmin(chat_id: int, user_id: int, requested_by: int) -> None
     ).delete()
     await rk.get_redis().srem(rk.k_sub(chat_id), str(user_id))
     await _invalidate(chat_id, user_id)
+
+
+# --------------------------------------------------------------------------
+# hierarchy -> operational RBAC synchronization
+# --------------------------------------------------------------------------
+async def sync_operational_role(
+    chat_id: int, user_id: int, role: Role, granted_by: int
+) -> None:
+    """Mirror an organizational rank into the operational RBAC layer.
+
+    Called only after ``hierarchy.can_appoint()`` has authorized the actor.
+    GOD members are authoritative and never overwritten here.
+    """
+    if await is_god(user_id):
+        return
+
+    r = rk.get_redis()
+    if role >= Role.ADMIN:
+        await RoleBinding.update_or_create(
+            chat_id=chat_id,
+            user_id=user_id,
+            defaults={"role": RoleBinding.ADMIN, "granted_by": granted_by},
+        )
+        await r.srem(rk.k_sub(chat_id), str(user_id))
+        await r.sadd(rk.k_admin(chat_id), str(user_id))
+    elif role == Role.SUBADMIN:
+        await RoleBinding.update_or_create(
+            chat_id=chat_id,
+            user_id=user_id,
+            defaults={"role": RoleBinding.SUBADMIN, "granted_by": granted_by},
+        )
+        await r.srem(rk.k_admin(chat_id), str(user_id))
+        await r.sadd(rk.k_sub(chat_id), str(user_id))
+    else:
+        await clear_operational_role(chat_id, user_id)
+        return
+
+    await _invalidate(chat_id, user_id)
+    log.info(
+        "OPERATIONAL sync: user=%s chat=%s role=%s by=%s",
+        user_id,
+        chat_id,
+        int(role),
+        granted_by,
+    )
+
+
+async def clear_operational_role(chat_id: int, user_id: int) -> None:
+    """Remove operational grants after a hierarchical demotion to USER."""
+    if await is_god(user_id):
+        return
+    r = rk.get_redis()
+    await RoleBinding.filter(chat_id=chat_id, user_id=user_id).delete()
+    await r.srem(rk.k_admin(chat_id), str(user_id))
+    await r.srem(rk.k_sub(chat_id), str(user_id))
+    await _invalidate(chat_id, user_id)
+    log.info("OPERATIONAL cleared: user=%s chat=%s", user_id, chat_id)

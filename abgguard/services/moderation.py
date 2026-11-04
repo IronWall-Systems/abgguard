@@ -424,9 +424,14 @@ async def delete_and_ban(
     # both the Worker and the Master funnel through the very same event bus.
     if notify and deleted:
         try:
-            await bot.send_message(chat_id, redact_public_reason(notify))
+            sent = await bot.send_message(chat_id, redact_public_reason(notify))
         except Exception:
             pass
+        else:
+            _spawn(
+                delete_after(bot, chat_id, sent.message_id, 30.0),
+                name="warn-clean",
+            )
 
 
 async def delete_and_mute(

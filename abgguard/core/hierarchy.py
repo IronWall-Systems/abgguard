@@ -32,15 +32,17 @@ _LEVEL: dict[str, int] = {
     Role.USER: 0,
 }
 
-# Who can appoint each role (set of appointing roles)
+# Who can appoint each role (set of appointing roles). GOD is intentionally
+# restricted to GOD only; USER is the demotion target and is additionally
+# guarded by can_demote() so nobody can remove an equal/higher-ranked member.
 _CAN_APPOINT: dict[str, set[str]] = {
-    Role.GOD: {Role.GOD, Role.DEPUTY, Role.SENIOR_CHAT, Role.SENIOR_CALL},
+    Role.GOD: {Role.GOD},
     Role.DEPUTY: {Role.GOD},
     Role.SENIOR_CHAT: {Role.GOD, Role.DEPUTY},
     Role.SENIOR_CALL: {Role.GOD, Role.DEPUTY},
     Role.ADMIN_CHAT: {Role.GOD, Role.DEPUTY, Role.SENIOR_CHAT},
     Role.ADMIN_CALL: {Role.GOD, Role.DEPUTY, Role.SENIOR_CALL},
-    Role.USER: set(),
+    Role.USER: {Role.GOD, Role.DEPUTY, Role.SENIOR_CHAT, Role.SENIOR_CALL},
 }
 
 # Uniform custom title templates (no emojis, <= 16 chars per Telegram API)
@@ -133,8 +135,33 @@ def level(role: str) -> int:
     return _LEVEL.get(role, 0)
 
 
-def can_appoint(actor_role: str, target_role: str) -> bool:
-    """Return True if actor_role can appoint/demote target_role."""
+def can_demote(actor_role: str, current_role: str) -> bool:
+    """Return True when actor outranks the member they are demoting.
+
+    The current rank decides the permission, not the destination: this stops a
+    Senior Chat from stripping a Deputy simply because both end at USER.
+    """
+    if current_role in {Role.USER, Role.GOD}:
+        return False
+    if actor_role == Role.GOD:
+        return True
+    if level(actor_role) <= level(current_role):
+        return False
+    return actor_role in _CAN_APPOINT.get(current_role, set())
+
+
+def can_appoint(
+    actor_role: str, target_role: str, current_role: str | None = None
+) -> bool:
+    """Return True if actor_role can appoint/demote target_role.
+
+    ``current_role`` is required for demotions (``target_role == USER``) so the
+    check can compare the actor against the member's existing rank.
+    """
+    if target_role == Role.USER:
+        if current_role is not None:
+            return can_demote(actor_role, current_role)
+        return actor_role in _CAN_APPOINT.get(Role.USER, set())
     return actor_role in _CAN_APPOINT.get(target_role, set())
 
 
