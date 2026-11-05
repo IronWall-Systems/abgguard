@@ -265,14 +265,14 @@ async def _onboard(bot: Bot, chat_id: int, title: str | None) -> None:
                     chat_id, title or str(chat_id),
                     subscription.TRIAL_HOURS, present, is_admin,
                 ),
-                ui.onboarding_kb(chat_id),
+                ui.onboarding_kb(chat_id, back="abg:back"),
             ),
             name=f"onboard-trial:{chat_id}",
         )
         return
 
     text, kb = ui.subscription_required(
-        chat_id, title or str(chat_id), count, present, is_admin
+        chat_id, title or str(chat_id), count, present, is_admin, back="abg:back"
     )
     _spawn(_send_card(bot, chat_id, text, kb), name=f"onboard-unpaid:{chat_id}")
 
@@ -304,7 +304,7 @@ async def on_master_membership(event: ChatMemberUpdated, bot: Bot) -> None:
     F.text.func(lambda t: t and t.split(maxsplit=1)[0].split("@", 1)[0] == "/sub"),
 )
 async def on_sub_command(message: Message, bot: Bot) -> None:
-    """/sub in the group -> the current subscription status card + tutorial."""
+    """/sub in the group -> the current subscription status card."""
     chat_id = message.chat.id
     try:
         await message.delete()
@@ -322,7 +322,7 @@ async def on_sub_command(message: Message, bot: Bot) -> None:
     text = ui.active_state_text(
         chat_id, message.chat.title or str(chat_id), status, exp, present, is_admin
     )
-    kb = ui.subscribe_kb(chat_id, paid=ui.is_premium(status, exp))
+    kb = ui.subscribe_kb(chat_id, paid=ui.is_premium(status, exp), back="abg:back")
     await message.answer(text, reply_markup=kb)
 
 
@@ -349,6 +349,7 @@ async def on_sub_callback(cq: CallbackQuery, bot: Bot) -> None:
     row = await subscription.record_join(chat_id)
     active = await subscription.is_active(chat_id)
     title = row.title or str(chat_id)
+    back = "pv:substat" if cq.message.chat.type == "private" else "abg:back"
     if action == "pay":
         # dedicated payment screen - works in groups AND in the bot's PV
         await cq.message.answer(
@@ -376,10 +377,12 @@ async def on_sub_callback(cq: CallbackQuery, bot: Bot) -> None:
         past, is_admin = (False, False)
         if cq.message.chat.type != "private":
             past, is_admin = await _dual_bot_state(bot, chat_id)
-        text, kb = ui.subscription_required(chat_id, title, 0, past, is_admin)
+        text, kb = ui.subscription_required(
+            chat_id, title, 0, past, is_admin, back=back
+        )
     else:
         text = ui.pay_view_text(chat_id, title, GroupSubscription.ACTIVE, row.expires_at)
-        kb = ui.subscribe_kb(chat_id, paid=True)
+        kb = ui.subscribe_kb(chat_id, paid=True, back=back)
 
     try:
         await cq.message.answer(text, reply_markup=kb)

@@ -18,6 +18,7 @@ from abgguard.master.ephemeral import fa_num, notice
 from abgguard.master.keyboards import (
     TOGGLES,
     badwords_menu_kb,
+    panel_help_kb,
     panel_kb,
     state_label,
     subadmin_menu_kb,
@@ -37,19 +38,7 @@ PANEL_TITLE = "🛡 پنل مدیریت گروه"
 # step 2: strict RBAC - unregistered users are kept out of the panel
 RBAC_REJECT = "⛔️ فقط ادمین‌ها و ساب‌ادمین‌های ثبت‌شده به پنل دسترسی دارند."
 
-HELP_TEXT = (
-    "❓ راهنما\n\n"
-    "🔵 وضعیت هر دکمه:\n"
-    "🟢 فعال = قفل روشن است\n"
-    "🔴 غیرفعال = قفل باز است\n\n"
-    "🔞 پورن: اسکن محلی تصاویر توسط هوش مصنوعی\n"
-    "🖼 🎥 🎞: مسدود کردن نوع رسانه\n"
-    "😀 ایموجی: مسدود کردن ایموجی در متن\n"
-    "🔗 لینک: حذف پیام حاوی لینک\n"
-    "🔄 فوروارد: حذف پیام فوروارد شده\n\n"
-    "🤬 کلمات رکیک: فهرست سیاه گروه\n"
-    "👥 ساب‌ادمین‌ها: فقط برای ادمین گروه (Level 2)"
-)
+HELP_TEXT = ui.public_help_text()
 
 
 # ------------------------------------------------------------------ utils --
@@ -349,7 +338,7 @@ async def on_panel_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> N
             await cq.bot.send_message(
                 chat_id,
                 ui.pay_view_text(chat_id, title, row.status, row.expires_at),
-                reply_markup=ui.renew_kb(chat_id),
+                reply_markup=ui.renew_kb(chat_id, back="abg:back"),
             )
         except Exception as exc:
             log.debug("subscription card failed: %s", exc)
@@ -503,7 +492,7 @@ async def on_panel_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> N
         await _ack(cq)
         await msg.edit_text(
             HELP_TEXT,
-            reply_markup=panel_kb(
+            reply_markup=panel_help_kb(
                 await settings_store.get_flags(chat_id),
                 role,
                 await trigger_store.get_trigger(chat_id),

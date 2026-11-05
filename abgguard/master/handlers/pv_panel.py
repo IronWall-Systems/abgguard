@@ -590,7 +590,7 @@ async def pv_close(cq: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.in_({"pv:root", "pv:home"}))
 async def pv_root(cq: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     user = cq.from_user
-    if user is None:
+    if user is None or await _pv_ids(cq) is None:
         await _ack(cq)
         return
     if await rbac.get_pv_role(user.id) < Role.SUBADMIN:
@@ -714,7 +714,10 @@ async def pv_substat(cq: CallbackQuery, state: FSMContext) -> None:
         ])
     if not entries:
         lines.append("هنوز گروهی ثبت نشده است.")
-    await _edit(cq, "\n".join(lines), ui.markup(*rows, [ui.support_btn()]))
+    rows.append([ui.support_btn()])
+    rows.append([ui.btn_cb(ui.BACK_LABEL, "pv:root")])
+    rows.append([ui.btn_cb(ui.CLOSE_LABEL, "pv:close")])
+    await _edit(cq, "\n".join(lines), ui.markup(*rows))
 
 
 @router.callback_query(F.data.startswith("pv:substat:"))
@@ -734,7 +737,11 @@ async def pv_substat_chat(cq: CallbackQuery, state: FSMContext) -> None:
     titles = await groups_store.known_titles([chat_id])
     title = titles.get(chat_id, str(chat_id))
     row = await subscription.record_join(chat_id, title)
-    kb = ui.subscribe_kb(chat_id, paid=ui.is_premium(row.status, row.expires_at))
+    kb = ui.subscribe_kb(
+        chat_id,
+        paid=ui.is_premium(row.status, row.expires_at),
+        back="pv:substat",
+    )
     await _edit(cq, ui.pay_view_text(chat_id, title, row.status, row.expires_at), kb)
 
 

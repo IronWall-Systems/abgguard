@@ -1,5 +1,14 @@
 # Agent Changelog
 
+## 2026-11-05 — Help Placement & Subscription Navigation Fix
+
+- Removed the full install/management tutorial from subscription status, trial, expiry, and payment cards.
+- The group-panel `❓ راهنما` button now opens the comprehensive management guide (6-tier hierarchy, mute syntax, auto-filters, wipe rules) instead of the brief lock legend.
+- Added a Back button to the group subscription card (`abg:back`), PV subscription list (`pv:root`), and PV per-group subscription card (`pv:substat`).
+- Added Back to the group help screen while keeping Close as the final row.
+- Subscription keyboards now always keep Close at the bottom; the PV root handler is private-chat only so a stray group callback cannot render the dashboard in a group.
+- `ruff check .` and `python -m compileall` pass.
+
 ## 2026-11-05 — Profanity Strike Fix & In-App Help Overhaul
 
 ### Profanity Strikes 1-4 Are Delete-Only

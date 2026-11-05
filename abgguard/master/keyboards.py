@@ -76,6 +76,18 @@ def panel_kb(
     )
 
 
+def panel_help_kb(
+    flags: GroupFlags, role: Role, trigger: str = DEFAULT_TRIGGER_NAME
+) -> InlineKeyboardMarkup:
+    """The help screen keeps the panel controls, adds Back, and keeps Close last."""
+    rows = list(panel_kb(flags, role, trigger).inline_keyboard)
+    rows.insert(
+        -1,
+        [InlineKeyboardButton(text="🔙 بازگشت", callback_data="abg:back")],
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def trigger_menu_kb() -> InlineKeyboardMarkup:
     """Back + close while typing a new panel trigger name."""
     return InlineKeyboardMarkup(

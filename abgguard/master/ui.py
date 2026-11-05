@@ -34,6 +34,9 @@ WORKER = settings.worker_username
 # direct support (owner directive): @pyyple
 SUPPORT_URL = "https://t.me/pyyple"
 
+BACK_LABEL = "[🔙 بازگشت | Back]"
+CLOSE_LABEL = "[❌ بستن پنل | Close]"
+
 # step-3 exact texts
 PAUSED_TEXT = (
     "⏳ مدت استفاده از ربات در این گروه به اتمام رسیده است، لطفا برای استفاده مجدد آن ، "
@@ -368,26 +371,32 @@ def _payment_rows(chat_id: int, paid: bool = False) -> list[list[InlineKeyboardB
     return rows
 
 
-def renew_kb(chat_id: int) -> InlineKeyboardMarkup:
+def renew_kb(chat_id: int, back: str | None = "pv:root") -> InlineKeyboardMarkup:
     """Payment details + Support, right where the admin is standing."""
-    return subscribe_kb(chat_id)
+    return subscribe_kb(chat_id, back=back)
 
 
-def subscribe_kb(chat_id: int, paid: bool = False) -> InlineKeyboardMarkup:
+def subscribe_kb(
+    chat_id: int, paid: bool = False, back: str | None = "pv:root"
+) -> InlineKeyboardMarkup:
     rows = _payment_rows(chat_id, paid=paid)
     rows.append([btn_cb("🔄 بارگذاری دوباره وضعیت", f"sub:menu:{chat_id}")])
-    rows.append([btn_cb("[❌ بستن پنل | Close]", "pv:close")])
+    if back:
+        rows.append([btn_cb(BACK_LABEL, back)])
+    rows.append([btn_cb(CLOSE_LABEL, "pv:close")])
     return markup(*rows)
 
 
-def onboarding_kb(chat_id: int) -> InlineKeyboardMarkup:
+def onboarding_kb(chat_id: int, back: str | None = "pv:root") -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [btn_url(f"➕ افزودن @{WORKER} با دسترسی ادمین", botpair.add_worker_url())],
         [btn_copy(f"🆔 کپی شناسه گروه ({chat_id})", str(chat_id))],
     ]
     rows += _payment_rows(chat_id)
     rows.append([btn_cb("🔄 بارگذاری دوباره وضعیت", f"sub:menu:{chat_id}")])
-    rows.append([btn_cb("[❌ بستن پنل | Close]", "pv:close")])
+    if back:
+        rows.append([btn_cb(BACK_LABEL, back)])
+    rows.append([btn_cb(CLOSE_LABEL, "pv:close")])
     return markup(*rows)
 
 
@@ -398,12 +407,17 @@ def trial_activated(chat_id: int, title: str, hours: int, present: bool, is_admi
         f"⏳ مدت: <b>{hours} ساعت</b>\n\n"
         + dual_bot_warning(present, is_admin)
         + "\n\n"
-        + tutorial_text(chat_id)
+        + "💡 برای راهنمای کامل مدیریت، دکمهٔ «❓ راهنما» را در پنل بزنید."
     )
 
 
 def subscription_required(
-    chat_id: int, title: str, count: int, present: bool, is_admin: bool
+    chat_id: int,
+    title: str,
+    count: int,
+    present: bool,
+    is_admin: bool,
+    back: str | None = "pv:root",
 ) -> tuple[str, InlineKeyboardMarkup]:
     text = (
         f"{icon('shield')} <b>ABG Guard فعال شد!</b>\n"
@@ -414,9 +428,9 @@ def subscription_required(
         f"💳 اشتراک ۳۰ روزه: <b>{PRICE_TEXT}</b> یا <b>${settings.price_usd}</b>\n"
         f"🎁 تست رایگان ۲۴ ساعته: فقط گروه‌های بالای "
         f"<b>{settings.trial_min_members} عضو</b> (یک‌بار)\n\n"
-        + tutorial_text(chat_id)
+        + "💡 برای راهنمای کامل مدیریت، دکمهٔ «❓ راهنما» را در پنل بزنید."
     )
-    return text, onboarding_kb(chat_id)
+    return text, onboarding_kb(chat_id, back=back)
 
 
 def trial_expired(chat_id: int, title: str, present: bool, is_admin: bool) -> str:
@@ -427,7 +441,7 @@ def trial_expired(chat_id: int, title: str, present: bool, is_admin: bool) -> st
         + "\n\n"
         + f"💳 برای ادامه محافظت اشتراک ۳۰ روزه فعال کنید "
         f"(<b>{PRICE_TEXT}</b> یا <b>${settings.price_usd}</b>).\n\n"
-        + tutorial_text(chat_id)
+        + "💡 برای راهنمای کامل مدیریت، دکمهٔ «❓ راهنما» را در پنل بزنید."
     )
 
 
@@ -440,16 +454,13 @@ def active_state_text(
         f"📅 وضعیت اشتراک: {status_line(status, expires_at)}\n\n"
         + dual_bot_warning(present, is_admin)
         + "\n\n"
-        + tutorial_text(chat_id, paid=is_premium(status, expires_at))
+        + "💡 برای راهنمای کامل مدیریت، دکمهٔ «❓ راهنما» را در پنل بزنید."
     )
 
 
 def pay_view_text(chat_id: int, title: str, status: str, expires_at) -> str:
     """The private-chat view behind `?start=pay_{chat_id}` deep-links."""
-    text = subscribe_text(chat_id, title, status, expires_at)
-    return text.strip() + "\n\n" + tutorial_text(
-        chat_id, paid=is_premium(status, expires_at)
-    )
+    return subscribe_text(chat_id, title, status, expires_at)
 
 
 def pay_screen_text(chat_id: int, title: str, status: str, expires_at) -> str:
@@ -491,8 +502,6 @@ async def pay_screen_kb(
     rows = await _gateway_rows()
     rows.append([btn_cb("📤 ارسال فیش پرداخت (در همین ربات)", f"sub:receipt:{chat_id}")])
     rows.append([btn_url("💬 پشتیبانی", support_url())])
-    rows.append(
-        [btn_cb("🔙 بازگشت", back or f"sub:menu:{chat_id}")]
-    )
-    rows.append([btn_cb("[❌ بستن پنل | Close]", "pv:close")])
+    rows.append([btn_cb(BACK_LABEL, back or f"sub:menu:{chat_id}")])
+    rows.append([btn_cb(CLOSE_LABEL, "pv:close")])
     return markup(*rows)
