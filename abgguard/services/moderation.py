@@ -21,6 +21,25 @@ log = logging.getLogger("abgguard.moderation")
 MUTE_REASON = re.compile(r"^mute:(?P<reason>.*):(?P<seconds>\d+)s$")
 # "permamute:<reason>" - a permanent restriction instead of an outright ban
 PERMA_REASON = re.compile(r"^permamute:(?P<reason>.+)$")
+# "deleteonly:<reason>" - strikes 1-4: delete + warn, never restrict
+DELETE_ONLY_REASON = re.compile(r"^deleteonly:(?P<reason>.+)$")
+
+STRIKE_TTL = 24 * 3600
+# Escalating mute durations keyed by strike count. Strikes 1-4 are delete-only.
+STRIKE_MUTE_SECONDS: dict[int, int] = {
+    5: 300,      # 5 minutes
+    6: 600,      # 10 minutes
+    7: 1800,     # 30 minutes
+    8: 3600,     # 1 hour
+}
+STRIKE_MUTE_DEFAULT = 24 * 3600
+STRIKE_DURATION_TEXT: dict[int, str] = {
+    5: "۵ دقیقه",
+    6: "۱۰ دقیقه",
+    7: "۳۰ دقیقه",
+    8: "۱ ساعت",
+}
+STRIKE_DURATION_DEFAULT = "۲۴ ساعت"
 # Public warnings must only ever show the label, never the matched word.
 _BADWORD_PUBLIC = re.compile(r"کلمه رکیک\s*\([^)]*\)")
 
@@ -293,8 +312,10 @@ async def handle_ban_event(bot: Bot, raw: str, me_id: int) -> None:
 
     # `delete_and_mute()` shares the same durable queue as a real ban so that
     # temporary sanctions survive a restart too. The reason carries the intent:
-    # "permamute:<reason>" -> permanent restriction, "mute:<reason>:<seconds>s"
-    # -> timed restrict, anything else -> a ban-worthy infraction.
+    # "deleteonly:<reason>" -> strikes 1-4 (no restriction),
+    # "permamute:<reason>" -> permanent restriction,
+    # "mute:<reason>:<seconds>s" -> timed restrict,
+    # anything else -> a ban-worthy infraction.
     #
     # INVARIANT: this function NEVER calls `ban_chat_member`. Every autonomous
     # sanction on a person is a permanent mute; a ban-worthy infraction is
@@ -302,8 +323,13 @@ async def handle_ban_event(bot: Bot, raw: str, me_id: int) -> None:
     # only that human may reply «بن» to actually remove the member.
     perma_hit = PERMA_REASON.match(reason)
     mute_hit = MUTE_REASON.match(reason)
+    delete_only_hit = DELETE_ONLY_REASON.match(reason)
     escalate_owner = False
-    if perma_hit is not None:
+    if delete_only_hit is not None:
+        reason = delete_only_hit.group("reason")
+        action = "DELETE"
+        label = "حذف پیام"
+    elif perma_hit is not None:
         await perm_mute(bot, chat_id, user_id)
         action = "PERMUTE"
         label = "سکوت دائم (Permanent Mute)"
@@ -469,3 +495,80 @@ async def delete_and_mute(
         content_report=content_report,
     )
     log.info("MUTED user=%s chat=%s for %ss (%s)", user_id, chat_id, seconds, reason)
+
+
+async def escalate_content_violation(
+    bot: Bot,
+    *,
+    chat_id: int,
+    user_id: int,
+    message_id: int,
+    reason: str,
+    log_reason: str | None = None,
+    target_name: str | None = None,
+    target_username: str | None = None,
+    content_report: bool = False,
+    message_text: str | None = None,
+    actor_source: str | None = None,
+) -> int:
+    """Delete + strike, muting only from strike 5 onward.
+
+    This is the single shared ladder for text and media-caption profanity. The
+    event bus must receive an explicit intent: ``deleteonly:`` for strikes 1-4
+    and ``mute:<reason>:<seconds>s`` from strike 5, otherwise a bare reason is
+    interpreted as a permanent mute by ``handle_ban_event()``.
+    """
+    private_reason = log_reason or reason
+    await safe_delete(bot, chat_id, message_id)
+
+    r = rk.get_redis()
+    strike_key = rk.k_strike(chat_id, user_id)
+    strike_count = int(await r.incr(strike_key))
+    if strike_count == 1:
+        await r.expire(strike_key, STRIKE_TTL)
+
+    should_mute = strike_count >= 5
+    mute_seconds = STRIKE_MUTE_SECONDS.get(strike_count, STRIKE_MUTE_DEFAULT)
+    mention = f'<a href="tg://user?id={user_id}">{user_id}</a>'
+
+    if should_mute:
+        duration_text = STRIKE_DURATION_TEXT.get(strike_count, STRIKE_DURATION_DEFAULT)
+        warning_text = (
+            f"🔇 کاربر {mention} به دلیل تکرار تخلف ({strike_count} بار) "
+            f"به مدت {duration_text} سکوت شد."
+        )
+        await mute(bot, chat_id, user_id, mute_seconds)
+        action_taken = (
+            "سکوت ۲۴ ساعته"
+            if mute_seconds >= STRIKE_MUTE_DEFAULT
+            else f"سکوت {mute_seconds // 60} دقیقه"
+        )
+        event_reason = f"mute:{private_reason}:{mute_seconds}s"
+    else:
+        warning_text = (
+            f"⚠️ کاربر {mention}، پیام شما به دلیل محتوای نامناسب پاک شد. "
+            f"(اخطار {strike_count}/4)"
+        )
+        action_taken = "حذف پیام فقط"
+        event_reason = f"deleteonly:{private_reason}"
+
+    try:
+        warning = await bot.send_message(chat_id, warning_text)
+        _spawn(delete_after(bot, chat_id, warning.message_id, 30.0), name="warn-clean")
+    except Exception:
+        pass
+
+    await publish_ban_event(
+        chat_id=chat_id,
+        user_id=user_id,
+        reason=event_reason,
+        message_id=message_id,
+        actor_source=actor_source,
+        target_name=target_name,
+        target_username=target_username,
+        content_report=content_report,
+        message_text=message_text,
+        strike_count=strike_count,
+        action_taken=action_taken,
+    )
+    return strike_count

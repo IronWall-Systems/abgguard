@@ -11,12 +11,9 @@ from abgguard.core.rbac import Role
 from abgguard.services import antiflood, strikes, subscription, textguards
 from abgguard.services.harvester import harvester
 from abgguard.services.moderation import (
-    _spawn,
-    delete_after,
     delete_and_ban,
     delete_and_mute,
-    mute,
-    publish_ban_event,
+    escalate_content_violation,
     safe_delete,
 )
 from abgguard.services.textguards import find_emoji, find_link, is_bot_message
@@ -31,25 +28,6 @@ router.message.filter(
 )
 
 MSG_CACHE_TTL = 7 * 24 * 3600
-
-# Escalating mute durations (seconds) keyed by strike count.
-# Strikes 1-4: no mute (delete only). Strike 5+: progressive mute.
-_STRIKE_MUTE_SECONDS: dict[int, int] = {
-    5: 300,      # 5 minutes
-    6: 600,      # 10 minutes
-    7: 1800,     # 30 minutes
-    8: 3600,     # 1 hour
-}
-_STRIKE_MUTE_DEFAULT = 86400  # 24 hours for strike 9+
-
-_STRIKE_DURATION_TEXT: dict[int, str] = {
-    5: "۵ دقیقه",
-    6: "۱۰ دقیقه",
-    7: "۳۰ دقیقه",
-    8: "۱ ساعت",
-}
-_STRIKE_DURATION_DEFAULT = "۲۴ ساعت"
-
 
 def _k_msg(chat_id: int, message_id: int) -> str:
     return f"{rk.P}:msg:{chat_id}:{message_id}"
@@ -93,72 +71,23 @@ async def _escalate(
     content_report: bool = False,
     message_text: str | None = None,
 ) -> None:
-    """Escalating strike system for profanity & NSFW violations.
+    """Master-side wrapper around the shared content-violation ladder.
 
-    Always deletes the offending message, then increments a Redis strike
-    counter (TTL 24h). Mutes only when strike >= 5 with progressive duration.
-    Sends an auto-deleting public warning and a PV ModLog card.
+    Strikes 1-4 delete + warn only; strike 5+ adds the escalating mute.
     """
-    private_reason = log_reason or reason
-    await safe_delete(bot, chat_id, message_id)
     await _mark_dirty(chat_id, message_id)
-
-    # Increment strike counter (24h TTL).
-    strike_key = rk.k_strike(chat_id, user_id)
-    r = rk.get_redis()
-    strike_count = await r.incr(strike_key)
-    if strike_count == 1:
-        await r.expire(strike_key, 86400)
-
-    # Determine mute duration based on strike count.
-    mute_seconds = _STRIKE_MUTE_SECONDS.get(strike_count, _STRIKE_MUTE_DEFAULT)
-    should_mute = strike_count >= 5
-
-    # Build public warning text.
-    mention = _mention_id(user_id)
-    if strike_count < 5:
-        warning_text = (
-            f"⚠️ کاربر {mention}، پیام شما به دلیل محتوای نامناسب پاک شد. "
-            f"(اخطار {strike_count}/4)"
-        )
-    else:
-        duration_text = _STRIKE_DURATION_TEXT.get(strike_count, _STRIKE_DURATION_DEFAULT)
-        warning_text = (
-            f"🔇 کاربر {mention} به دلیل تکرار تخلف ({strike_count} بار) "
-            f"به مدت {duration_text} سکوت شد."
-        )
-
-    # Apply mute if strike >= 5.
-    if should_mute:
-        await mute(bot, chat_id, user_id, mute_seconds)
-
-    # Send auto-deleting public warning.
-    try:
-        warning = await bot.send_message(chat_id, warning_text)
-        _spawn(delete_after(bot, chat_id, warning.message_id, 30.0), name="warn-clean")
-    except Exception:
-        pass
-
-    # Queue the sanction event for the ModLog PV card.
-    action_taken = (
-        "حذف پیام فقط"
-        if not should_mute
-        else f"سکوت {mute_seconds // 60} دقیقه"
-        if mute_seconds < 86400
-        else "سکوت ۲۴ ساعته"
-    )
-    await publish_ban_event(
+    await escalate_content_violation(
+        bot,
         chat_id=chat_id,
         user_id=user_id,
-        reason=private_reason,
         message_id=message_id,
-        actor_source="master",
+        reason=reason,
+        log_reason=log_reason,
         target_name=target_name,
         target_username=target_username,
         content_report=content_report,
         message_text=message_text,
-        strike_count=strike_count,
-        action_taken=action_taken,
+        actor_source="master",
     )
 
 

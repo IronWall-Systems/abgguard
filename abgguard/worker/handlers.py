@@ -14,7 +14,11 @@ from abgguard.services.media_guard import (
     punish_porn,
     scan_media,
 )
-from abgguard.services.moderation import delete_and_mute, safe_delete
+from abgguard.services.moderation import (
+    delete_and_mute,
+    escalate_content_violation,
+    safe_delete,
+)
 from abgguard.services.textguards import (
     find_link,
     is_bot_message,
@@ -67,17 +71,18 @@ async def on_media(message: Message, bot: Bot) -> None:
             return
         hit = await settings_store.contains_badword(chat_id, message.caption)
         if hit:
-            await delete_and_mute(
+            await escalate_content_violation(
                 bot,
                 chat_id=chat_id,
                 user_id=user.id,
                 message_id=message.message_id,
-                seconds=600,
-                reason=f"کلمه رکیک ({hit})",
+                reason="کلمه رکیک",
+                log_reason=f"کلمه رکیک ({hit})",
                 actor_source="watchdog",
                 target_name=user.full_name,
                 target_username=user.username,
                 content_report=True,
+                message_text=message.caption,
             )
             return
 

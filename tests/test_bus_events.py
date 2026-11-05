@@ -94,6 +94,17 @@ def test_mute_reason_parses_from_the_right(monkeypatch) -> None:
     assert calls == [("mute", -100, 10, 600)]
 
 
+def test_delete_only_event_never_mutes(monkeypatch) -> None:
+    """Profanity strikes 1-4 publish `deleteonly:` - delete, never restrict."""
+    calls, rows = _run(
+        monkeypatch, "deleteonly:کلمه رکیک (bad)", message_id=42
+    )
+    assert calls == [("delete", -100, 42)]
+    assert rows[0]["reason"] == "کلمه رکیک (bad)"
+    assert NOTES[0]["action"] == "حذف پیام"
+    assert ESCALATIONS == []
+
+
 def test_plain_reason_mutes_forever_instead_of_banning(monkeypatch) -> None:
     """A ban-worthy infraction is a permanent mute - never a `ban_chat_member`."""
     calls, rows = _run(monkeypatch, "پورن")

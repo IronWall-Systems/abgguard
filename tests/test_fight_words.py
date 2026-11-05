@@ -13,7 +13,7 @@ from abgguard.core import redis as rk
 from abgguard.core.rbac import Role
 from abgguard.core.settings_store import GroupFlags
 from abgguard.master.handlers import guards
-from abgguard.services import antiflood, strikes
+from abgguard.services import antiflood, moderation, strikes
 from abgguard.services.textguards import DEFAULT_FIGHT_WORDS, find_fight_word
 
 # mild Gen-Z slang - must never be blocked and must keep flowing into the ML
@@ -121,8 +121,17 @@ class _Pipe:
 
 
 class _FakeRedis:
+    counts: ClassVar[dict[str, int]] = {}
+
     async def smembers(self, key: str) -> set[str]:
         return set()
+
+    async def incr(self, key: str) -> int:
+        type(self).counts[key] = type(self).counts.get(key, 0) + 1
+        return type(self).counts[key]
+
+    async def expire(self, key: str, ttl: int) -> bool:
+        return True
 
     def pipeline(self, transaction: bool = False) -> _Pipe:
         return _Pipe()
@@ -218,6 +227,7 @@ class _Rec:
         self.cached: list[int] = []
         self.sent: list[str] = []
         self.sources: list[str | None] = []
+        self.published: list[dict] = []
 
 
 REC = _Rec()
@@ -278,6 +288,15 @@ async def _mute(
     return True
 
 
+async def _mute_plain(bot, chat_id: int, user_id: int, seconds: int):
+    REC.mutes.append((chat_id, user_id, seconds))
+    return True
+
+
+async def _publish(**kwargs):
+    REC.published.append(kwargs)
+
+
 async def _ban(
     bot,
     *,
@@ -310,11 +329,16 @@ async def _bot_send_message(self, chat_id, text=None, *args, **kwargs) -> None:
 
 def _install(monkeypatch) -> None:
     REC.reset()
+    _FakeRedis.counts = {}
     monkeypatch.setattr(rbac, "get_role", _get_role)
     monkeypatch.setattr(settings_store, "get_flags", _get_flags)
     monkeypatch.setattr(settings_store, "load_badwords", _words)
     monkeypatch.setattr(antiflood, "check_text_flood", _flood)
     monkeypatch.setattr(strikes, "register", _register_strike)
+    monkeypatch.setattr(rk, "get_redis", lambda: _FakeRedis())
+    monkeypatch.setattr(moderation, "safe_delete", _delete)
+    monkeypatch.setattr(moderation, "mute", _mute_plain)
+    monkeypatch.setattr(moderation, "publish_ban_event", _publish)
     monkeypatch.setattr(guards, "_cache_message", _cache_message)
     monkeypatch.setattr(guards, "_mark_dirty", _mark_dirty)
     monkeypatch.setattr(guards, "safe_delete", _delete)
@@ -336,11 +360,22 @@ def test_severe_word_is_deleted_struck_and_kept_out_of_the_dataset(master, monke
 
     assert REC.deleted == [(-1001, 5)]
     assert REC.dirty == [(-1001, 5)], "the deleted message must be flagged dirty"
-    assert REC.strikes == [(-1001, 7)], "the offense counter must increment"
-    assert REC.mutes == [(-1001, 7, 600)]
+    assert REC.mutes == [], "strikes 1-4 must only delete and warn"
     assert REC.bans == []
+    assert REC.published[0]["reason"].startswith("deleteonly:")
+    assert REC.published[0]["strike_count"] == 1
     assert REC.harvested == [], "a fight word must never reach the ML dataset"
-    assert REC.sources == ["master"], "an automatic guard acts as the Master bot"
+    assert REC.published[0]["actor_source"] == "master"
+
+
+def test_fifth_profanity_strike_starts_the_mute_ladder(master, monkeypatch) -> None:
+    _install(monkeypatch)
+    _FakeRedis.counts[rk.k_strike(-1001, 7)] = 4
+    _feed(master, "تو یه مادرجنده‌ای هستی")
+
+    assert REC.mutes == [(-1001, 7, 300)]
+    assert REC.published[0]["reason"].startswith("mute:کلمه رکیک")
+    assert REC.published[0]["strike_count"] == 5
 
 
 def test_obfuscated_severe_word_is_still_caught(master, monkeypatch) -> None:
