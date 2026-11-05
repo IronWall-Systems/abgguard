@@ -206,6 +206,7 @@ def public_start_kb(role: Role) -> InlineKeyboardMarkup:
     entry = _panel_entry_kb(role)
     if entry:
         rows.append(entry)
+    rows.append([_b(CLOSE_LABEL, "pv:close")])
     return _markup(*rows)
 
 
@@ -217,6 +218,7 @@ def public_help_kb(role: Role) -> InlineKeyboardMarkup:
     if entry:
         rows.append(entry)
     rows.append([_b(BACK_LABEL, "pv:public:start")])
+    rows.append([_b(CLOSE_LABEL, "pv:close")])
     return _markup(*rows)
 
 
@@ -234,6 +236,7 @@ def public_mygroups_kb(
     entry = _panel_entry_kb(role)
     if entry:
         rows.append(entry)
+    rows.append([_b(CLOSE_LABEL, "pv:close")])
     return _markup(*rows)
 
 

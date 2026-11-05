@@ -1,5 +1,24 @@
 # Agent Changelog
 
+## 2026-11-05 — Profanity Strike Fix & In-App Help Overhaul
+
+### Profanity Strikes 1-4 Are Delete-Only
+- Root cause: the guard ladder already avoided muting on strikes 1-4, but it published a bare reason to the event bus. `handle_ban_event()` interpreted any bare reason as a permanent mute, so the first offense still restricted the member.
+- Added the explicit `deleteonly:<reason>` event intent and handled it in `handle_ban_event()` as delete + log only, with no restriction and no owner escalation.
+- Extracted the shared `escalate_content_violation()` ladder into `services/moderation.py`; text and media-caption profanity now use the same path.
+- Strikes 1-4: delete + 30-second public warning only. Strike 5: 5 minutes; 6: 10 minutes; 7: 30 minutes; 8: 1 hour; 9+: 24 hours.
+- Worker media-caption profanity no longer calls `delete_and_mute()` directly.
+- Updated `tests/test_fight_words.py` and `tests/test_bus_events.py` for delete-only behavior and the fifth-strike mute.
+
+### Help Text & Close Button
+- Rewrote the interactive help sections and `/help` guide around the 6-tier organizational hierarchy, promotion/demotion syntax, mute semantics, wipe confirmation, and the two authorization layers.
+- `ui.public_help_text()` now matches `USER_MANUAL_FA.md` instead of the outdated command catalog.
+- Updated the PV tutorial and public start snippets for correct mute/wipe/hierarchy wording.
+- Private `/help` now opens the role-aware interactive menu.
+- Added `[❌ بستن پنل | Close]` (`pv:close`) to public help/start/mygroups keyboards and to subscription/onboarding/payment keyboards.
+- Updated `USER_MANUAL_FA.md` to document automatic hierarchy ↔ operational RBAC sync.
+- `ruff check .` and `python -m compileall` pass.
+
 ## 2026-11-04 — UI/UX, ModLog, RBAC Sync & Safety Optimization
 
 ### Lock Panels
