@@ -7,7 +7,8 @@ import logging
 import random
 
 from aiogram import Bot, F, Router
-from aiogram.enums import ChatMemberStatus
+from aiogram.enums import ChatMemberStatus, ContentType
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Filter
 from aiogram.types import (
     CallbackQuery,
@@ -182,34 +183,26 @@ async def on_left_member(message: Message) -> None:
 # --------------------------------------------------- service message cleanup --
 @router.message(
     F.chat.type.in_({"group", "supergroup"}),
-    F.new_chat_members
-    | F.left_chat_member
-    | F.pinned_message
-    | F.video_chat_scheduled
-    | F.video_chat_started
-    | F.video_chat_ended
-    | F.video_chat_participants_invited
-    | F.message_auto_delete_timer_changed
-    | F.proximity_alert_triggered
-    | F.forum_topic_created
-    | F.forum_topic_edited
-    | F.forum_topic_closed
-    | F.forum_topic_reopened
-    | F.general_forum_topic_hidden
-    | F.general_forum_topic_unhidden
-    | F.invoice
-    | F.passport_data
-    | F.voice_chat_scheduled
-    | F.voice_chat_started
-    | F.voice_chat_ended
-    | F.voice_chat_participants_invited,
+    F.content_type.in_({
+        ContentType.NEW_CHAT_MEMBERS,
+        ContentType.LEFT_CHAT_MEMBER,
+        ContentType.PINNED_MESSAGE,
+        ContentType.NEW_CHAT_TITLE,
+        ContentType.NEW_CHAT_PHOTO,
+        ContentType.DELETE_CHAT_PHOTO,
+        ContentType.VIDEO_CHAT_STARTED,
+        ContentType.VIDEO_CHAT_ENDED,
+        ContentType.VIDEO_CHAT_PARTICIPANTS_INVITED,
+        ContentType.MESSAGE_AUTO_DELETE_TIMER_CHANGED,
+    })
 )
 async def on_service_message(message: Message) -> None:
     """Instantly delete all Telegram service messages and system notifications
     to keep the group chat completely clean."""
     try:
         await message.delete()
-    except Exception:
+    except TelegramBadRequest:
+        # Already removed / bot lacks rights → swallow silently.
         pass
 
 
