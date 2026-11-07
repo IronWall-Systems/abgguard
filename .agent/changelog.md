@@ -1,5 +1,12 @@
 # Agent Changelog
 
+## 2026-11-07 — Refactor: Remove all custom title assignment logic from promotion commands
+
+- Completely removed automated custom title assignment (`set_chat_administrator_custom_title`) from promotion/demotion commands (`نصب معاون`, `نصب ارشد چت`, `نصب ادمین چت`, etc.).
+- Deleted `_clean_custom_title()`, `_reply_custom_title()`, and the `custom_title_text` parameter from `_do_promote()`.
+- Promotion commands now only handle ID/Username/Reply targeting — any text after the command or ID is ignored.
+- Custom titles are now 100% manual (set via Telegram UI only).
+
 ## 2026-11-07 — Security: Restrict custom title assignment to Senior tier and above
 
 - Custom title assignment (`set_chat_administrator_custom_title`) is now restricted to actors with hierarchy level >= 4 (Senior Chat / Senior Call / Deputy / God).

@@ -24,7 +24,7 @@ from abgguard.master.ephemeral import delete_later, fa_num, notice, spawn
 from abgguard.master.keyboards import wipe_confirm_kb
 from abgguard.models.entities import BanLog
 from abgguard.services import moderation, modlog, strikes, subscription
-from abgguard.services.textguards import EMOJI_RE, is_bot_message
+from abgguard.services.textguards import is_bot_message
 
 log = logging.getLogger("abgguard.master.modcmd")
 
@@ -1010,27 +1010,6 @@ CUSTOM_TITLE_LIMIT = 16
 BOT_MANAGED_TITLES = frozenset(hierarchy.CUSTOM_TITLES.values())
 
 
-def _clean_custom_title(raw: str | None) -> str:
-    """Return a Telegram-safe custom title.
-
-    Emojis are stripped, whitespace is collapsed, and the result is truncated
-    to Telegram's 16-character limit.
-    """
-    if not raw:
-        return ""
-    cleaned = EMOJI_RE.sub("", raw)
-    cleaned = re.sub("[\U0001F3FB-\U0001F3FF]", "", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned[:CUSTOM_TITLE_LIMIT].strip()
-
-
-def _reply_custom_title(message: Message) -> str:
-    """Use the replied-to message text or caption as a custom-title source."""
-    reply = message.reply_to_message
-    if reply is None:
-        return ""
-    return getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
-
 
 def _parse_role_command_details(
     text: str | None, *, has_reply: bool = False
@@ -1092,7 +1071,6 @@ async def _do_promote(
     command_text: str,
     target_role: str,
     explicit_id: int | None = None,
-    custom_title_text: str | None = None,
 ) -> None:
     """Promote/demote a replied-to user or an explicitly supplied Telegram id."""
     chat_id = message.chat.id
@@ -1182,25 +1160,7 @@ async def _do_promote(
         await notice(message, "❌ نصب مقام انجام نشد؛ خطای داخلی رخ داد.", delay=7.0)
         return
 
-    # Custom title: command text, replied message text/caption, or role default.
-    # Only Senior tier (level >= 4) and above may set custom titles.
-    title = ""
-    if target_role != hierarchy.Role.USER and hierarchy.level(actor_role) >= 4:
-        title_source = (custom_title_text or "").strip() or _reply_custom_title(message)
-        title = _clean_custom_title(title_source)
-        if not title:
-            title = _clean_custom_title(hierarchy.custom_title(target_role))
-    if title:
-        try:
-            await bot.set_chat_administrator_custom_title(
-                chat_id=chat_id, user_id=target_id, custom_title=title
-            )
-        except (TelegramBadRequest, TelegramForbiddenError) as exc:
-            log.warning("set custom title failed: %s", exc)
-        except Exception:
-            log.exception("set custom title crashed")
 
-    # Keep the two authorization layers aligned.
     try:
         if target_role == hierarchy.Role.USER:
             await hierarchy.remove_role(chat_id, target_id)
@@ -1390,12 +1350,11 @@ async def on_role_command(message: Message, bot: Bot) -> None:
         if hierarchy.level(actor_role) < hierarchy.level(hierarchy.Role.ADMIN_CALL):
             return
 
-    command_text, target_role, explicit_id, custom_title_text = parsed
+    command_text, target_role, explicit_id = parsed
     await _do_promote(
         message,
         bot,
         command_text,
         target_role,
         explicit_id,
-        custom_title_text,
     )
