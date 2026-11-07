@@ -1013,28 +1013,28 @@ BOT_MANAGED_TITLES = frozenset(hierarchy.CUSTOM_TITLES.values())
 
 def _parse_role_command_details(
     text: str | None, *, has_reply: bool = False
-) -> tuple[str, str, int | None, str] | None:
-    """Parse a role command plus its optional id and custom-title text.
+) -> tuple[str, str, int | None] | None:
+    """Parse a role command plus its optional explicit user id.
 
-    Returns ``(command_text, target_role, explicit_user_id, custom_title)``.
-    Any text after the command is treated as the custom title. A leading
-    numeric token is still accepted as an explicit Telegram id when the
-    command is not a reply; with a reply, numeric text is a title.
+    Returns ``(command_text, target_role, explicit_user_id)``.
+    A leading numeric token is accepted as an explicit Telegram id when the
+    command is not a reply. Any trailing text after the command or ID is ignored.
     """
     raw = _normalize_role_text(text)
     if not raw:
         return None
     for alias, target_role in _ROLE_ALIASES:
         if raw == alias:
-            return alias, target_role, None, ""
+            return alias, target_role, None
         if raw.startswith(alias + " "):
             remainder = raw[len(alias):].strip()
             if not remainder:
-                return alias, target_role, None, ""
-            first, _, rest = remainder.partition(" ")
+                return alias, target_role, None
+            first, _, _rest = remainder.partition(" ")
             if first.isdigit() and not has_reply:
-                return alias, target_role, int(first), rest.strip()
-            return alias, target_role, None, remainder
+                return alias, target_role, int(first)
+            # With a reply, ignore trailing text (no custom title parsing).
+            return alias, target_role, None
     return None
 
 
@@ -1042,11 +1042,7 @@ def _parse_role_command(
     text: str | None, *, has_reply: bool = False
 ) -> tuple[str, str, int | None] | None:
     """Backward-compatible parser returning the command, role and target id."""
-    parsed = _parse_role_command_details(text, has_reply=has_reply)
-    if parsed is None:
-        return None
-    command_text, target_role, explicit_id, _title = parsed
-    return command_text, target_role, explicit_id
+    return _parse_role_command_details(text, has_reply=has_reply)
 
 
 async def _effective_hierarchy_role(chat_id: int, user_id: int) -> str:

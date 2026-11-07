@@ -1,5 +1,12 @@
 # Agent Changelog
 
+## 2026-11-07 — Fix: Restore broken promote/demote commands after custom title refactor
+
+- Fixed `ValueError: too many values to unpack` in `on_role_command` caused by `_parse_role_command_details` still returning 4 values while the caller unpacked only 3.
+- Updated `_parse_role_command_details` to return only `(command_text, target_role, explicit_id)` — removed the `custom_title` from the return tuple.
+- Simplified `_parse_role_command` to directly delegate to `_parse_role_command_details`.
+- Promotion/demotion commands now work correctly again: they accept targeting via Reply, Numeric ID, or Username (e.g., `نصب ادمین چت 123456789`) and ignore any trailing text.
+
 ## 2026-11-07 — Refactor: Remove all custom title assignment logic from promotion commands
 
 - Completely removed automated custom title assignment (`set_chat_administrator_custom_title`) from promotion/demotion commands (`نصب معاون`, `نصب ارشد چت`, `نصب ادمین چت`, etc.).
