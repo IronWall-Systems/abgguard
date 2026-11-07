@@ -28,7 +28,7 @@ from abgguard.master import ui
 from abgguard.master.ephemeral import delete_later
 from abgguard.models.entities import GroupSubscription
 from abgguard.services import antiflood, subscription
-from abgguard.services.moderation import NO_SEND, temp_mute_chat
+from abgguard.services.moderation import temp_mute_chat
 
 log = logging.getLogger("abgguard.master.members")
 
@@ -468,6 +468,7 @@ def _spawn(coro, *, name: str) -> asyncio.Task:
 
 
 DEFAULT_WELCOME = "👋 خوش آمدی {mention}!"
+JOIN_CAPTCHA_DELAY = 5.0
 _DIGITS = str.maketrans(
     "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
     "01234567890123456789",
@@ -480,6 +481,14 @@ def _k_captcha(chat_id: int, user_id: int) -> str:
 
 def _k_verified(chat_id: int) -> str:
     return f"{rk.P}:verified:{chat_id}"
+
+
+def _k_join_delay(chat_id: int, user_id: int) -> str:
+    return f"{rk.P}:join_delay:{chat_id}:{user_id}"
+
+
+async def _is_join_captcha_pending(chat_id: int, user_id: int) -> bool:
+    return bool(await rk.get_redis().exists(_k_join_delay(chat_id, user_id)))
 
 
 def _math_challenge() -> tuple[str, int]:
@@ -499,15 +508,6 @@ def _math_challenge() -> tuple[str, int]:
 
 def _normalize_answer(text: str | None) -> str:
     return (text or "").strip().translate(_DIGITS)
-
-
-def _profile_ok(user) -> bool:
-    return bool(
-        user
-        and user.id > 0
-        and not user.is_bot
-        and (user.full_name or "").strip()
-    )
 
 
 async def _get_captcha_state(chat_id: int, user_id: int) -> dict | None:
@@ -592,6 +592,12 @@ async def _greet(bot: Bot, chat_id: int, user) -> None:
     pipe.pfadd(rk.k_stats_seen(chat_id), str(user.id))
     await pipe.execute()
 
+    # A join-request approval already owns the delayed CAPTCHA task. Without
+    # this guard the chat_member update would start the challenge immediately
+    # and bypass the required 5-second delay.
+    if await _is_join_captcha_pending(chat_id, user.id):
+        return
+
     policy = await settings_store.get_policy(chat_id)
     needs_captcha = (
         policy.captcha_enabled
@@ -620,10 +626,11 @@ async def _send_welcome(bot: Bot, chat_id: int, user, template: str) -> None:
 
 
 async def _start_captcha(bot: Bot, chat_id: int, user) -> bool:
-    """Restrict the newcomer and ask a one-answer math challenge.
+    """Ask a one-answer math challenge.
 
-    Returns False when the restriction or prompt could not be sent, so the
-    caller can fall back to a plain welcome.
+    The user is NOT restricted - they must be free to type their numeric
+    answer. Returns False when the prompt could not be sent, so the caller
+    can fall back to a plain welcome.
     """
     r = rk.get_redis()
     key = _k_captcha(chat_id, user.id)
@@ -636,20 +643,13 @@ async def _start_captcha(bot: Bot, chat_id: int, user) -> bool:
     try:
         if await r.exists(key):
             return True
-        try:
-            await bot.restrict_chat_member(chat_id, user.id, permissions=NO_SEND)
-        except Exception:
-            log.debug(
-                "captcha restrict failed chat=%s user=%s",
-                chat_id, user.id, exc_info=True,
-            )
-            return False
 
         question, answer = _math_challenge()
         try:
             prompt = await bot.send_message(
                 chat_id,
-                "🛡 <b>تایید هویت</b>\n\n"
+                "🛡 <b>تایید هویت</b>\n"
+                f"{_render_welcome('{mention}', user, chat_id)}\n\n"
                 "برای ارسال پیام، پاسخ عبارت ریاضی زیر را به صورت عدد صحیح بفرستید:\n\n"
                 f"<code>{question}</code>\n\n"
                 f"⏱ {settings.captcha_timeout} ثانیه",
@@ -678,35 +678,15 @@ async def _start_captcha(bot: Bot, chat_id: int, user) -> bool:
 
 
 async def _captcha_expiry(bot: Bot, chat_id: int, user_id: int, prompt_id: int) -> None:
-    """No verification in time -> kick the account (never a mass ban)."""
+    """No verification in time -> just delete the prompt (never ban)."""
     await asyncio.sleep(settings.captcha_timeout)
     r = rk.get_redis()
     if not await r.delete(_k_captcha(chat_id, user_id)):
         return  # already verified
     try:
-        await bot.ban_chat_member(chat_id, user_id)
-        await bot.unban_chat_member(chat_id, user_id)
-    except Exception:
-        log.debug("captcha kick failed chat=%s user=%s", chat_id, user_id,
-                  exc_info=True)
-    try:
         await bot.delete_message(chat_id, prompt_id)
     except Exception:
         pass
-
-
-async def _decline_join_request(bot: Bot, chat_id: int, user, reason: str) -> None:
-    try:
-        await bot.decline_chat_join_request(chat_id, user.id)
-    except Exception:
-        log.debug(
-            "join request decline failed chat=%s user=%s",
-            chat_id, user.id, exc_info=True,
-        )
-    log.info(
-        "JOIN REQUEST declined chat=%s user=%s reason=%s",
-        chat_id, user.id, reason,
-    )
 
 
 async def _complete_captcha(
@@ -737,60 +717,56 @@ async def _complete_captcha(
     log.info("CAPTCHA passed chat=%s user=%s", chat_id, user.id)
 
 
+async def _delayed_join_captcha(bot: Bot, chat_id: int, user) -> None:
+    """Wait 5 seconds after approval, then challenge the new member."""
+    await asyncio.sleep(JOIN_CAPTCHA_DELAY)
+    r = rk.get_redis()
+    await r.delete(_k_join_delay(chat_id, user.id))
+
+    if (
+        await rbac.get_role(chat_id, user.id) >= Role.SUBADMIN
+        or await _is_verified(chat_id, user.id)
+    ):
+        policy = await settings_store.get_policy(chat_id)
+        await _send_welcome(
+            bot, chat_id, user, policy.welcome_text or DEFAULT_WELCOME
+        )
+        return
+
+    if await _start_captcha(bot, chat_id, user):
+        return
+
+    log.warning(
+        "delayed join captcha failed chat=%s user=%s", chat_id, user.id
+    )
+    policy = await settings_store.get_policy(chat_id)
+    await _send_welcome(bot, chat_id, user, policy.welcome_text or DEFAULT_WELCOME)
+
+
 @captcha_router.chat_join_request()
 async def on_join_request(request: ChatJoinRequest, bot: Bot) -> None:
-    """Screen join requests, approve valid users, then start the math CAPTCHA."""
+    """Approve every join request immediately, then delay the CAPTCHA 5s."""
     chat = request.chat
     user = request.from_user
-    if chat.type not in {"group", "supergroup"}:
+    if chat.type not in {"group", "supergroup"} or user is None:
         return
 
-    if not _profile_ok(user):
-        await _decline_join_request(bot, chat.id, user, "invalid profile/bot")
-        return
-
-    try:
-        photos = await bot.get_user_profile_photos(user.id, limit=1)
-    except Exception:
-        log.warning(
-            "join request photo check failed chat=%s user=%s",
-            chat.id, user.id, exc_info=True,
-        )
-        await _decline_join_request(bot, chat.id, user, "photo check failed")
-        return
-    if photos.total_count < 1:
-        await _decline_join_request(bot, chat.id, user, "no profile photo")
-        return
-
-    if not user.username:
-        log.info(
-            "join request user=%s has no username; profile still accepted",
-            user.id,
-        )
-
+    r = rk.get_redis()
+    await r.set(_k_join_delay(chat.id, user.id), "1", ex=15)
     try:
         await bot.approve_chat_join_request(chat.id, user.id)
     except Exception:
+        await r.delete(_k_join_delay(chat.id, user.id))
         log.warning(
             "join request approve failed chat=%s user=%s",
             chat.id, user.id, exc_info=True,
         )
         return
+
     log.info("JOIN REQUEST approved chat=%s user=%s", chat.id, user.id)
-
-    policy = await settings_store.get_policy(chat.id)
-    needs_captcha = (
-        policy.captcha_enabled
-        and await rbac.get_role(chat.id, user.id) < Role.SUBADMIN
-        and not await _is_verified(chat.id, user.id)
-    )
-    if needs_captcha:
-        await asyncio.sleep(1.0)
-        if await _start_captcha(bot, chat.id, user):
-            return
-
-    await _send_welcome(
-        bot, chat.id, user, policy.welcome_text or DEFAULT_WELCOME
+    _spawn(
+        _delayed_join_captcha(bot, chat.id, user),
+        name=f"join-captcha:{chat.id}:{user.id}",
     )
 
 

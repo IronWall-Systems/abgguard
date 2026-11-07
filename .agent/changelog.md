@@ -1,5 +1,24 @@
 # Agent Changelog
 
+## 2026-11-07 — Fix: 5-minute captcha timeout, safe number-only input, and 30s auto-deleting welcome
+
+### Join Request Approval
+- `chat_join_request` now approves every join request immediately without any profile screening (no photo or username checks).
+
+### 5-Second Delay & 5-Minute Captcha Timeout
+- After approval, the bot waits 5 seconds, then sends the Smart Math Captcha challenge in the group.
+- Redis state TTL for the unverified captcha state increased from 60 to 300 seconds (`captcha_timeout` in `config.py`).
+
+### Safe Captcha Interaction (No Bans)
+- Unverified users are **NOT** restricted from sending text numbers — they can type their numeric answer freely.
+- Correct number: verify them, add to safe list, delete prompt/answer messages, send welcome greeting.
+- Non-number input: instantly delete their message, send a temporary auto-deleting warning asking them to solve the math captcha — **never ban**.
+
+### Auto-Cleaning Welcome Message
+- On successful captcha, send a welcome message mentioning/tagging the user (e.g., *"خوش آمدی [نام](tg://user?id=...)!"*).
+- Welcome message auto-deletes after 30 seconds.
+- All bot warnings, captcha prompts, and alerts auto-delete — zero bot footprint.
+
 ## 2026-11-07 — Admin Audit & Combined Title Sync (`بررسی ادمین`)
 
 - Added the `بررسی ادمین` / `/audit_admins` command for Level 2+ staff.

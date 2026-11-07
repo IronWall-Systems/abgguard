@@ -159,7 +159,7 @@ class Settings:
 
     webapp_url: str = ""
     support_url: str = ""
-    captcha_timeout: int = 60
+    captcha_timeout: int = 300
     broadcast_delay: float = 0.05
 
     # Local Telegram Bot API server (enables >48h deletions / bulk purge).
