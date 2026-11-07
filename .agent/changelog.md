@@ -1,5 +1,11 @@
 # Agent Changelog
 
+## 2026-11-07 — Feature: Auto-delete all Telegram service messages and system notification logs
+
+- Added a service message handler that instantly deletes all Telegram service messages as soon as they appear in the group.
+- Covers: `new_chat_members`, `left_chat_member`, `pinned_message`, `video_chat_scheduled/started/ended/participants_invited`, `message_auto_delete_timer_changed`, `proximity_alert_triggered`, `forum_topic_created/edited/closed/reopened`, `general_forum_topic_hidden/unhidden`, `invoice`, `passport_data`, `voice_chat_scheduled/started/ended/participants_invited`.
+- Each service message is deleted via `await message.delete()` inside a `try/except` block to gracefully handle missing permissions.
+
 ## 2026-11-07 — Fix: 5-minute captcha timeout, safe number-only input, and 30s auto-deleting welcome
 
 ### Join Request Approval

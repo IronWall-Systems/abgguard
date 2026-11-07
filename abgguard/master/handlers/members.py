@@ -179,6 +179,40 @@ async def on_left_member(message: Message) -> None:
         pass
 
 
+# --------------------------------------------------- service message cleanup --
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.new_chat_members
+    | F.left_chat_member
+    | F.pinned_message
+    | F.video_chat_scheduled
+    | F.video_chat_started
+    | F.video_chat_ended
+    | F.video_chat_participants_invited
+    | F.message_auto_delete_timer_changed
+    | F.proximity_alert_triggered
+    | F.forum_topic_created
+    | F.forum_topic_edited
+    | F.forum_topic_closed
+    | F.forum_topic_reopened
+    | F.general_forum_topic_hidden
+    | F.general_forum_topic_unhidden
+    | F.invoice
+    | F.passport_data
+    | F.voice_chat_scheduled
+    | F.voice_chat_started
+    | F.voice_chat_ended
+    | F.voice_chat_participants_invited,
+)
+async def on_service_message(message: Message) -> None:
+    """Instantly delete all Telegram service messages and system notifications
+    to keep the group chat completely clean."""
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
 # ================================================ SaaS onboarding (my_chat_member) ==
 async def _dual_bot_state(bot: Bot, chat_id: int) -> tuple[bool, bool]:
     """(present, is_admin) for @ABGGUARD1BOT inside this chat."""
@@ -493,17 +527,13 @@ async def _is_join_captcha_pending(chat_id: int, user_id: int) -> bool:
 
 def _math_challenge() -> tuple[str, int]:
     """Return a simple whole-number question and its exact answer."""
-    operation = random.choice(("*", "-", "/"))
-    if operation == "*":
+    operation = random.choice(("x", "-"))
+    if operation == "x":
         left = random.randint(1, 10)
         right = random.randint(1, 10)
-        return f"{left} * {right} = ?", left * right
-    if operation == "-":
-        high, low = sorted(random.sample(range(1, 11), 2), reverse=True)
-        return f"{high} - {low} = ?", high - low
-    divisor = random.randint(2, 10)
-    answer = random.randint(1, 10 // divisor)
-    return f"{divisor * answer} / {divisor} = ?", answer
+        return f"{left} x {right} = ?", left * right
+    high, low = sorted(random.sample(range(1, 11), 2), reverse=True)
+    return f"{high} - {low} = ?", high - low
 
 
 def _normalize_answer(text: str | None) -> str:
