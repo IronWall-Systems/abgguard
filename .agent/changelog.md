@@ -1,5 +1,11 @@
 # Agent Changelog
 
+## 2026-11-07 — Security: Restrict custom title assignment to Senior tier and above
+
+- Custom title assignment (`set_chat_administrator_custom_title`) is now restricted to actors with hierarchy level >= 4 (Senior Chat / Senior Call / Deputy / God).
+- Lower tiers (Chat Admin, Call Admin, Sub-Admin - Tier 3 and below) can no longer set custom titles via promotion commands.
+- If a Tier 3 or lower admin uses a promotion command with a custom title, the title request is ignored and only the standard default role title is applied.
+
 ## 2026-11-07 — Feature: Auto-delete all Telegram service messages and system notification logs
 
 - Added a service message handler that instantly deletes all Telegram service messages as soon as they appear in the group.

@@ -1183,8 +1183,9 @@ async def _do_promote(
         return
 
     # Custom title: command text, replied message text/caption, or role default.
+    # Only Senior tier (level >= 4) and above may set custom titles.
     title = ""
-    if target_role != hierarchy.Role.USER:
+    if target_role != hierarchy.Role.USER and hierarchy.level(actor_role) >= 4:
         title_source = (custom_title_text or "").strip() or _reply_custom_title(message)
         title = _clean_custom_title(title_source)
         if not title:
