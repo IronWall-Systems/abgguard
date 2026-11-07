@@ -1,5 +1,14 @@
 # Agent Changelog
 
+## 2026-11-07 — Admin Audit & Combined Title Sync (`بررسی ادمین`)
+
+- Added the `بررسی ادمین` / `/audit_admins` command for Level 2+ staff.
+- The audit fetches every group administrator and infers Chat/Call Admin roles from both the organizational hierarchy and Telegram permissions.
+- Administrators holding both Chat and Call Admin roles are synced to the combined `ادمین چت و کال` title.
+- Custom/manual titles and Redis-marked protected titles are never overwritten; only empty or bot-managed titles are updated.
+- Added the combined `ADMIN_CHAT_CALL` role so promotions merge Chat+Call admins and demotions fall back to the remaining single role.
+- The audit reply reports checked, updated, preserved, and failed counts.
+
 ## 2026-11-07 — Custom Titles From Promotion Commands & Replies
 
 - Promotion commands now accept an inline custom title after the command, e.g. `نصب ارشد چت مدیر کل`.

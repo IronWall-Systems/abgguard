@@ -13,7 +13,13 @@ from aiogram.types import ChatPermissions, Message
 
 from abgguard.core import hierarchy, rbac
 from abgguard.core.rbac import Role
-from abgguard.core.redis import VIP_TTL, revoke_user_vip, set_user_vip
+from abgguard.core.redis import (
+    VIP_TTL,
+    get_redis,
+    k_title_protected,
+    revoke_user_vip,
+    set_user_vip,
+)
 from abgguard.master.ephemeral import delete_later, fa_num, notice, spawn
 from abgguard.master.keyboards import wipe_confirm_kb
 from abgguard.models.entities import BanLog
@@ -122,6 +128,7 @@ HIERARCHY_OPERATIONAL_LEVEL: dict[str, Role] = {
     hierarchy.Role.SENIOR_CALL: Role.ADMIN,
     hierarchy.Role.ADMIN_CHAT: Role.SUBADMIN,
     hierarchy.Role.ADMIN_CALL: Role.SUBADMIN,
+    hierarchy.Role.ADMIN_CHAT_CALL: Role.SUBADMIN,
 }
 
 # Reply-driven silent cleanup: an admin answers a message with exactly one of
@@ -290,6 +297,28 @@ class RoleCommandTrigger(Filter):
         )
 
 
+AUDIT_ADMIN_TRIGGERS = frozenset({"بررسی ادمین", "audit_admins"})
+
+
+def is_admin_audit_trigger(text: str | None) -> bool:
+    """Match the Persian trigger or the slash command (with optional bot tag)."""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if raw.startswith("/"):
+        raw = raw[1:].strip()
+    raw = " ".join(raw.split()).translate(_ARABIC_CHARS).lower()
+    raw = raw.split("@", 1)[0].strip()
+    return raw in AUDIT_ADMIN_TRIGGERS
+
+
+class AdminAuditTrigger(Filter):
+    """Matches «بررسی ادمین» / «/audit_admins» in groups."""
+
+    async def __call__(self, message: Message) -> bool:
+        return is_admin_audit_trigger(message.text)
+
+
 class VipTrigger(Filter):
     """
     Matches a *reply* carrying a VIP trigger, written by staff only (Level 1-3).
@@ -418,6 +447,7 @@ async def _do_mute(message: Message, bot, target: int, args: str) -> None:
         hierarchy.Role.DEPUTY,
         hierarchy.Role.SENIOR_CHAT,
         hierarchy.Role.ADMIN_CHAT,
+        hierarchy.Role.ADMIN_CHAT_CALL,
     }:
         await notice(message, "❌ شما مجوز سکوت کردن ندارید.", delay=7.0)
         return
@@ -977,6 +1007,7 @@ _ROLE_ALIASES: tuple[tuple[str, str], ...] = tuple(
 
 
 CUSTOM_TITLE_LIMIT = 16
+BOT_MANAGED_TITLES = frozenset(hierarchy.CUSTOM_TITLES.values())
 
 
 def _clean_custom_title(raw: str | None) -> str:
@@ -1092,7 +1123,30 @@ async def _do_promote(
 
     actor_role = await _effective_hierarchy_role(chat_id, actor.id)
     current_role = await hierarchy.get_role(chat_id, target_id)
-    if not hierarchy.can_appoint(actor_role, target_role, current_role):
+    requested_role = target_role
+    if requested_role == hierarchy.Role.USER:
+        target_role = hierarchy.fallback_admin_role(current_role, command_text)
+        if current_role == hierarchy.Role.ADMIN_CHAT_CALL:
+            if target_role == hierarchy.Role.ADMIN_CALL:
+                allowed = hierarchy.can_demote(
+                    actor_role, hierarchy.Role.ADMIN_CHAT
+                )
+            elif target_role == hierarchy.Role.ADMIN_CHAT:
+                allowed = hierarchy.can_demote(
+                    actor_role, hierarchy.Role.ADMIN_CALL
+                )
+            else:
+                allowed = hierarchy.can_demote(
+                    actor_role, hierarchy.Role.ADMIN_CHAT_CALL
+                )
+        else:
+            allowed = hierarchy.can_appoint(
+                actor_role, hierarchy.Role.USER, current_role
+            )
+    else:
+        target_role = hierarchy.merged_admin_role(current_role, requested_role)
+        allowed = hierarchy.can_appoint(actor_role, requested_role, current_role)
+    if not allowed:
         await notice(
             message,
             "❌ شما مجوز نصب/عزل این مقام را ندارید.",
@@ -1158,7 +1212,16 @@ async def _do_promote(
                 await rbac.sync_operational_role(
                     chat_id, target_id, operational, granted_by=actor.id
                 )
-            result = "✅ کاربر به مقام منصوب شد، لقب و دسترسی عملیاتی دریافت کرد."
+            if (
+                current_role == hierarchy.Role.ADMIN_CHAT_CALL
+                and target_role in hierarchy.ADMIN_ROLES
+            ):
+                result = (
+                    "✅ یک بخش از دسترسی ادمین حذف شد و لقب و دسترسی "
+                    "به مقام باقی‌مانده تغییر کرد."
+                )
+            else:
+                result = "✅ کاربر به مقام منصوب شد، لقب و دسترسی عملیاتی دریافت کرد."
     except Exception:
         log.exception("role persistence failed")
         await notice(
@@ -1173,6 +1236,136 @@ async def _do_promote(
         "ROLE PROMOTE by %s on %s -> %s in %s (%s)",
         actor.id, target_id, target_role, chat_id, command_text,
     )
+
+
+async def _is_title_protected(chat_id: int, user_id: int) -> bool:
+    """Check the manual-title lock marker stored in Redis."""
+    try:
+        return bool(await get_redis().exists(k_title_protected(chat_id, user_id)))
+    except Exception:
+        log.debug("title protection check failed", exc_info=True)
+        return False
+
+
+def _admin_roles_from_member(role: str, member) -> set[str]:
+    """Infer Chat/Call Admin roles from hierarchy plus Telegram permissions."""
+    if getattr(member, "status", None) == "creator":
+        return set()
+
+    roles: set[str] = set()
+    if role == hierarchy.Role.ADMIN_CHAT:
+        roles.add(hierarchy.Role.ADMIN_CHAT)
+    elif role == hierarchy.Role.ADMIN_CALL:
+        roles.add(hierarchy.Role.ADMIN_CALL)
+    elif role == hierarchy.Role.ADMIN_CHAT_CALL:
+        roles.update(hierarchy.ADMIN_ROLES)
+    elif role != hierarchy.Role.USER:
+        return set()
+
+    if getattr(member, "can_delete_messages", False) or getattr(
+        member, "can_invite_users", False
+    ):
+        roles.add(hierarchy.Role.ADMIN_CHAT)
+    if getattr(member, "can_manage_video_chats", False) or getattr(
+        member, "can_manage_voice_chats", False
+    ):
+        roles.add(hierarchy.Role.ADMIN_CALL)
+    return roles
+
+
+def _audit_target_title(roles: set[str]) -> str:
+    if roles >= hierarchy.ADMIN_ROLES:
+        return hierarchy.custom_title(hierarchy.Role.ADMIN_CHAT_CALL)
+    if hierarchy.Role.ADMIN_CHAT in roles:
+        return hierarchy.custom_title(hierarchy.Role.ADMIN_CHAT)
+    if hierarchy.Role.ADMIN_CALL in roles:
+        return hierarchy.custom_title(hierarchy.Role.ADMIN_CALL)
+    return ""
+
+
+async def _admin_target_title(chat_id: int, member) -> str:
+    user = getattr(member, "user", None)
+    if user is None or getattr(user, "is_bot", False):
+        return ""
+    role = await hierarchy.get_role(chat_id, user.id)
+    return _audit_target_title(_admin_roles_from_member(role, member))
+
+
+@router.message(AdminAuditTrigger())
+async def on_admin_audit(message: Message, bot: Bot) -> None:
+    """Audit group administrators and sync only bot-managed titles."""
+    chat_id = message.chat.id
+    actor = message.from_user
+    if actor is None or chat_id is None or is_bot_message(message):
+        return
+
+    actor_role = await _effective_hierarchy_role(chat_id, actor.id)
+    if hierarchy.level(actor_role) < hierarchy.level(hierarchy.Role.DEPUTY):
+        await notice(message, "❌ شما مجوز بررسی ادمین‌ها را ندارید.", delay=7.0)
+        return
+
+    try:
+        admins = list(await bot.get_chat_administrators(chat_id))
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        log.warning("get_chat_administrators failed: %s", exc)
+        await notice(message, "❌ دریافت فهرست ادمین‌ها انجام نشد.", delay=7.0)
+        return
+    except Exception:
+        log.exception("get_chat_administrators crashed")
+        await notice(message, "❌ دریافت فهرست ادمین‌ها انجام نشد.", delay=7.0)
+        return
+
+    checked = len(admins)
+    updated = preserved = failed = 0
+    for member in admins:
+        user = getattr(member, "user", None)
+        if user is None or getattr(user, "is_bot", False):
+            continue
+
+        current_title = (getattr(member, "custom_title", None) or "").strip()
+        if await _is_title_protected(chat_id, user.id):
+            preserved += 1
+            continue
+        if current_title and current_title not in BOT_MANAGED_TITLES:
+            preserved += 1
+            continue
+
+        target_title = await _admin_target_title(chat_id, member)
+        if not target_title or current_title == target_title:
+            continue
+
+        try:
+            await bot.set_chat_administrator_custom_title(
+                chat_id=chat_id,
+                user_id=user.id,
+                custom_title=target_title,
+            )
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            failed += 1
+            log.warning(
+                "admin audit title update failed user=%s: %s", user.id, exc
+            )
+        except Exception:
+            failed += 1
+            log.exception("admin audit title update crashed user=%s", user.id)
+        else:
+            updated += 1
+            log.info(
+                "ADMIN AUDIT title synced chat=%s user=%s title=%s",
+                chat_id,
+                user.id,
+                target_title,
+            )
+
+    report = (
+        "🔎 <b>گزارش بررسی ادمین‌ها</b>\n"
+        f"👥 بررسی‌شده: {checked}\n"
+        f"✏️ به‌روزرسانی‌شده: {updated}\n"
+        f"🛡 عناوین سفارشی حفظ‌شده: {preserved}"
+    )
+    if failed:
+        report += f"\n⚠️ خطا: {failed}"
+    await notice(message, report, delay=30.0)
 
 
 @router.message(RoleCommandTrigger())

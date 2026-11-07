@@ -95,11 +95,17 @@ def k_strike(chat_id: int, user_id: int) -> str:
 
 # ---- Hierarchical RBAC role storage ----------------------------------------
 ROLE = f"{P}:role"  # + :{chat_id}:{user_id} -> role string
+TITLE_PROTECTED = f"{P}:title:protected"  # + :{chat_id}:{user_id} -> "1"
 
 
 def k_role(chat_id: int, user_id: int) -> str:
     """abg:role:{chat_id}:{user_id} -> hierarchical role string."""
     return f"{ROLE}:{chat_id}:{user_id}"
+
+
+def k_title_protected(chat_id: int, user_id: int) -> str:
+    """abg:title:protected:{chat_id}:{user_id} -> manual-title lock marker."""
+    return f"{TITLE_PROTECTED}:{chat_id}:{user_id}"
 
 
 # ---- SaaS subscription mirror + distributed heartbeat -----------------------

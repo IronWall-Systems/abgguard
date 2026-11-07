@@ -18,6 +18,7 @@ class Role(enum.StrEnum):
     SENIOR_CALL = "senior_call"
     ADMIN_CHAT = "admin_chat"
     ADMIN_CALL = "admin_call"
+    ADMIN_CHAT_CALL = "admin_chat_call"
     USER = "user"
 
 
@@ -29,6 +30,7 @@ _LEVEL: dict[str, int] = {
     Role.SENIOR_CALL: 4,
     Role.ADMIN_CHAT: 3,
     Role.ADMIN_CALL: 3,
+    Role.ADMIN_CHAT_CALL: 3,
     Role.USER: 0,
 }
 
@@ -42,6 +44,7 @@ _CAN_APPOINT: dict[str, set[str]] = {
     Role.SENIOR_CALL: {Role.GOD, Role.DEPUTY},
     Role.ADMIN_CHAT: {Role.GOD, Role.DEPUTY, Role.SENIOR_CHAT},
     Role.ADMIN_CALL: {Role.GOD, Role.DEPUTY, Role.SENIOR_CALL},
+    Role.ADMIN_CHAT_CALL: {Role.GOD, Role.DEPUTY},
     Role.USER: {Role.GOD, Role.DEPUTY, Role.SENIOR_CHAT, Role.SENIOR_CALL},
 }
 
@@ -52,6 +55,7 @@ CUSTOM_TITLES: dict[str, str] = {
     Role.SENIOR_CALL: "ارشد کال",
     Role.ADMIN_CHAT: "ادمین چت",
     Role.ADMIN_CALL: "ادمین کال",
+    Role.ADMIN_CHAT_CALL: "ادمین چت و کال",
 }
 
 # Telegram permissions granted per role
@@ -102,6 +106,15 @@ ROLE_PERMISSIONS: dict[str, dict] = {
         "can_manage_video_chats": True,
         "can_manage_voice_chats": True,
     },
+    Role.ADMIN_CHAT_CALL: {
+        "can_delete_messages": True,
+        "can_invite_users": True,
+        "can_restrict_members": False,
+        "can_pin_messages": False,
+        "can_promote_members": False,
+        "can_manage_video_chats": True,
+        "can_manage_voice_chats": True,
+    },
 }
 
 # Persian labels for each role
@@ -112,6 +125,7 @@ ROLE_LABELS_FA: dict[str, str] = {
     Role.SENIOR_CALL: "ارشد کال",
     Role.ADMIN_CHAT: "ادمین چت",
     Role.ADMIN_CALL: "ادمین کال",
+    Role.ADMIN_CHAT_CALL: "ادمین چت و کال",
     Role.USER: "کاربر",
 }
 
@@ -129,7 +143,35 @@ PROMOTE_ALIASES: dict[str, str] = {
     "عزل ادمین چت": Role.USER,
     "نصب ادمین کال": Role.ADMIN_CALL,
     "عزل ادمین کال": Role.USER,
+    "نصب ادمین چت و کال": Role.ADMIN_CHAT_CALL,
+    "عزل ادمین چت و کال": Role.USER,
 }
+
+ADMIN_ROLES = frozenset({Role.ADMIN_CHAT, Role.ADMIN_CALL})
+
+
+def merged_admin_role(current_role: str, target_role: str) -> str:
+    """Keep both admin sides when the counterpart role is assigned."""
+    if target_role in ADMIN_ROLES:
+        if current_role in ADMIN_ROLES and current_role != target_role:
+            return Role.ADMIN_CHAT_CALL
+        if current_role == Role.ADMIN_CHAT_CALL:
+            return Role.ADMIN_CHAT_CALL
+    return target_role
+
+
+def fallback_admin_role(current_role: str, command_text: str) -> str:
+    """When revoking one side of a combined admin, keep the other side."""
+    if current_role != Role.ADMIN_CHAT_CALL:
+        return Role.USER
+    raw = command_text or ""
+    removes_chat = "چت" in raw and "کال" not in raw
+    removes_call = "کال" in raw and "چت" not in raw
+    if removes_chat:
+        return Role.ADMIN_CALL
+    if removes_call:
+        return Role.ADMIN_CHAT
+    return Role.USER
 
 
 def level(role: str) -> int:
