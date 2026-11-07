@@ -18,7 +18,7 @@ from abgguard.master.ephemeral import delete_later, fa_num, notice, spawn
 from abgguard.master.keyboards import wipe_confirm_kb
 from abgguard.models.entities import BanLog
 from abgguard.services import moderation, modlog, strikes, subscription
-from abgguard.services.textguards import is_bot_message
+from abgguard.services.textguards import EMOJI_RE, is_bot_message
 
 log = logging.getLogger("abgguard.master.modcmd")
 
@@ -281,7 +281,13 @@ class RoleCommandTrigger(Filter):
     """
 
     async def __call__(self, message: Message) -> bool:
-        return _parse_role_command(message.text) is not None
+        return (
+            _parse_role_command(
+                message.text,
+                has_reply=message.reply_to_message is not None,
+            )
+            is not None
+        )
 
 
 class VipTrigger(Filter):
@@ -970,23 +976,67 @@ _ROLE_ALIASES: tuple[tuple[str, str], ...] = tuple(
 )
 
 
-def _parse_role_command(text: str | None) -> tuple[str, str, int | None] | None:
-    """Parse a promotion/demotion command, optionally followed by a user id.
+CUSTOM_TITLE_LIMIT = 16
 
-    Returns ``(command_text, target_role, explicit_user_id)``. The id is
-    ``None`` when the command must resolve its target from the reply.
+
+def _clean_custom_title(raw: str | None) -> str:
+    """Return a Telegram-safe custom title.
+
+    Emojis are stripped, whitespace is collapsed, and the result is truncated
+    to Telegram's 16-character limit.
+    """
+    if not raw:
+        return ""
+    cleaned = EMOJI_RE.sub("", raw)
+    cleaned = re.sub("[\U0001F3FB-\U0001F3FF]", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:CUSTOM_TITLE_LIMIT].strip()
+
+
+def _reply_custom_title(message: Message) -> str:
+    """Use the replied-to message text or caption as a custom-title source."""
+    reply = message.reply_to_message
+    if reply is None:
+        return ""
+    return getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
+
+
+def _parse_role_command_details(
+    text: str | None, *, has_reply: bool = False
+) -> tuple[str, str, int | None, str] | None:
+    """Parse a role command plus its optional id and custom-title text.
+
+    Returns ``(command_text, target_role, explicit_user_id, custom_title)``.
+    Any text after the command is treated as the custom title. A leading
+    numeric token is still accepted as an explicit Telegram id when the
+    command is not a reply; with a reply, numeric text is a title.
     """
     raw = _normalize_role_text(text)
     if not raw:
         return None
     for alias, target_role in _ROLE_ALIASES:
         if raw == alias:
-            return alias, target_role, None
+            return alias, target_role, None, ""
         if raw.startswith(alias + " "):
-            argument = raw[len(alias):].strip().split(maxsplit=1)[0]
-            target_id = int(argument) if argument.isdigit() else None
-            return alias, target_role, target_id
+            remainder = raw[len(alias):].strip()
+            if not remainder:
+                return alias, target_role, None, ""
+            first, _, rest = remainder.partition(" ")
+            if first.isdigit() and not has_reply:
+                return alias, target_role, int(first), rest.strip()
+            return alias, target_role, None, remainder
     return None
+
+
+def _parse_role_command(
+    text: str | None, *, has_reply: bool = False
+) -> tuple[str, str, int | None] | None:
+    """Backward-compatible parser returning the command, role and target id."""
+    parsed = _parse_role_command_details(text, has_reply=has_reply)
+    if parsed is None:
+        return None
+    command_text, target_role, explicit_id, _title = parsed
+    return command_text, target_role, explicit_id
 
 
 async def _effective_hierarchy_role(chat_id: int, user_id: int) -> str:
@@ -1011,6 +1061,7 @@ async def _do_promote(
     command_text: str,
     target_role: str,
     explicit_id: int | None = None,
+    custom_title_text: str | None = None,
 ) -> None:
     """Promote/demote a replied-to user or an explicitly supplied Telegram id."""
     chat_id = message.chat.id
@@ -1077,8 +1128,13 @@ async def _do_promote(
         await notice(message, "❌ نصب مقام انجام نشد؛ خطای داخلی رخ داد.", delay=7.0)
         return
 
-    # Custom title (no emojis, <= 16 chars)
-    title = hierarchy.custom_title(target_role)
+    # Custom title: command text, replied message text/caption, or role default.
+    title = ""
+    if target_role != hierarchy.Role.USER:
+        title_source = (custom_title_text or "").strip() or _reply_custom_title(message)
+        title = _clean_custom_title(title_source)
+        if not title:
+            title = _clean_custom_title(hierarchy.custom_title(target_role))
     if title:
         try:
             await bot.set_chat_administrator_custom_title(
@@ -1122,7 +1178,9 @@ async def _do_promote(
 @router.message(RoleCommandTrigger())
 async def on_role_command(message: Message, bot: Bot) -> None:
     """Handle promotion/demotion commands (نصب/عزل معاون, ارشد چت, ...)."""
-    parsed = _parse_role_command(message.text)
+    parsed = _parse_role_command_details(
+        message.text, has_reply=message.reply_to_message is not None
+    )
     if parsed is None:
         return
     chat_id = message.chat.id
@@ -1138,5 +1196,12 @@ async def on_role_command(message: Message, bot: Bot) -> None:
         if hierarchy.level(actor_role) < hierarchy.level(hierarchy.Role.ADMIN_CALL):
             return
 
-    command_text, target_role, explicit_id = parsed
-    await _do_promote(message, bot, command_text, target_role, explicit_id)
+    command_text, target_role, explicit_id, custom_title_text = parsed
+    await _do_promote(
+        message,
+        bot,
+        command_text,
+        target_role,
+        explicit_id,
+        custom_title_text,
+    )

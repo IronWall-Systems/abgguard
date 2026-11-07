@@ -1,5 +1,13 @@
 # Agent Changelog
 
+## 2026-11-07 — Custom Titles From Promotion Commands & Replies
+
+- Promotion commands now accept an inline custom title after the command, e.g. `نصب ارشد چت مدیر کل`.
+- When no inline title is provided, the replied-to message text or caption is used as the title source.
+- Custom titles are stripped of emojis, whitespace-normalized, and truncated to Telegram's 16-character limit.
+- If the resulting title is empty, the role's default title is used.
+- Explicit numeric target IDs remain supported; when replying, numeric text after the command is treated as a title.
+
 ## 2026-11-07 — Join Request Screening, Math CAPTCHA & Auto-Cleaning Welcome
 
 - Added a `chat_join_request` screener: rejects bots/invalid profiles and users without a profile photo, logs missing usernames, and approves valid requests.
