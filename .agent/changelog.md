@@ -1,5 +1,17 @@
 # Agent Changelog
 
+## 2026-11-07 — Join Request Screening, Math CAPTCHA & Auto-Cleaning Welcome
+
+- Added a `chat_join_request` screener: rejects bots/invalid profiles and users without a profile photo, logs missing usernames, and approves valid requests.
+- Approved join requests immediately enter the math CAPTCHA flow when the group CAPTCHA policy is enabled.
+- Replaced the inline-button CAPTCHA with a one-answer math challenge using `*`, positive `-`, and whole-number `/` questions (numbers 1-10).
+- Pending CAPTCHA state is stored in Redis with a 60-second timeout; unverified users are restricted from sending messages.
+- Any unverified message other than the exact numeric answer is deleted immediately, followed by a 12-second auto-deleting warning.
+- Correct answers delete both the prompt and the answer, lift the restriction, add the user to the Redis verified/safe list, and send a welcome greeting.
+- Welcome greetings now mention the user and auto-delete after 30 seconds; CAPTCHA prompts, warnings, and join-flood alerts also auto-delete.
+- Added a dedicated early `captcha_router` so unverified filtering runs before moderation/guards and cannot be bypassed by media or commands.
+- `ruff check` and join-request/CAPTCHA smoke tests pass.
+
 ## 2026-11-07 — Promotion Command Repair & Hierarchy UI
 
 ### Promotion Commands

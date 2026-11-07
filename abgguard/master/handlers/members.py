@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
+import random
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatMemberStatus
+from aiogram.filters import Filter
 from aiogram.types import (
     CallbackQuery,
+    ChatJoinRequest,
     ChatMemberUpdated,
     ChatPermissions,
     InlineKeyboardButton,
@@ -21,6 +25,7 @@ from abgguard.core import groups as groups_store
 from abgguard.core import redis as rk
 from abgguard.core.rbac import Role
 from abgguard.master import ui
+from abgguard.master.ephemeral import delete_later
 from abgguard.models.entities import GroupSubscription
 from abgguard.services import antiflood, subscription
 from abgguard.services.moderation import NO_SEND, temp_mute_chat
@@ -28,6 +33,7 @@ from abgguard.services.moderation import NO_SEND, temp_mute_chat
 log = logging.getLogger("abgguard.master.members")
 
 router = Router(name="master.members")
+captcha_router = Router(name="master.captcha")
 
 _ME_ID: int | None = None
 
@@ -98,13 +104,14 @@ async def _handle_join(bot: Bot, chat_id: int, user_id: int, token: str) -> bool
             chat_id, settings.join_lock_seconds,
         )
         try:
-            await bot.send_message(
+            sent = await bot.send_message(
                 chat_id,
                 "🚨 موج عضویت شناسایی شد!\n"
                 "گروه موقتاً برای جلوگیری از تبلیغات قفل شد "
                 f"({settings.join_lock_seconds} ثانیه).\n"
                 "هیچ کاربری بن نمی‌شود.",
             )
+            _spawn(delete_later(sent, 30), name=f"join-alert:{chat_id}")
         except Exception:
             pass
     return True
@@ -460,8 +467,87 @@ def _spawn(coro, *, name: str) -> asyncio.Task:
     return task
 
 
+DEFAULT_WELCOME = "👋 خوش آمدی {mention}!"
+_DIGITS = str.maketrans(
+    "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+    "01234567890123456789",
+)
+
+
 def _k_captcha(chat_id: int, user_id: int) -> str:
     return f"{rk.P}:captcha:{chat_id}:{user_id}"
+
+
+def _k_verified(chat_id: int) -> str:
+    return f"{rk.P}:verified:{chat_id}"
+
+
+def _math_challenge() -> tuple[str, int]:
+    """Return a simple whole-number question and its exact answer."""
+    operation = random.choice(("*", "-", "/"))
+    if operation == "*":
+        left = random.randint(1, 10)
+        right = random.randint(1, 10)
+        return f"{left} * {right} = ?", left * right
+    if operation == "-":
+        high, low = sorted(random.sample(range(1, 11), 2), reverse=True)
+        return f"{high} - {low} = ?", high - low
+    divisor = random.randint(2, 10)
+    answer = random.randint(1, 10 // divisor)
+    return f"{divisor * answer} / {divisor} = ?", answer
+
+
+def _normalize_answer(text: str | None) -> str:
+    return (text or "").strip().translate(_DIGITS)
+
+
+def _profile_ok(user) -> bool:
+    return bool(
+        user
+        and user.id > 0
+        and not user.is_bot
+        and (user.full_name or "").strip()
+    )
+
+
+async def _get_captcha_state(chat_id: int, user_id: int) -> dict | None:
+    raw = await rk.get_redis().get(_k_captcha(chat_id, user_id))
+    if not raw:
+        return None
+    try:
+        state = json.loads(raw)
+    except (TypeError, ValueError):
+        await rk.get_redis().delete(_k_captcha(chat_id, user_id))
+        return None
+    return state if isinstance(state, dict) else None
+
+
+async def _is_unverified(chat_id: int, user_id: int) -> bool:
+    return await _get_captcha_state(chat_id, user_id) is not None
+
+
+async def _is_verified(chat_id: int, user_id: int) -> bool:
+    return bool(await rk.get_redis().sismember(_k_verified(chat_id), str(user_id)))
+
+
+async def _mark_verified(chat_id: int, user_id: int) -> None:
+    await rk.get_redis().sadd(_k_verified(chat_id), str(user_id))
+
+
+class UnverifiedFilter(Filter):
+    """Matches only members who still have an active math challenge."""
+
+    async def __call__(self, message: Message) -> bool:
+        if message.chat.type not in {"group", "supergroup"}:
+            return False
+        if getattr(message, "new_chat_members", None) or getattr(
+            message, "left_chat_member", None
+        ):
+            return False
+        user = message.from_user
+        if user is None or user.is_bot:
+            return False
+        return await _is_unverified(message.chat.id, user.id)
 
 
 class _SafeMap(dict):
@@ -499,7 +585,7 @@ def _verify_kb(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
 
 
 async def _greet(bot: Bot, chat_id: int, user) -> None:
-    """Count the member, run the CAPTCHA when enabled, then welcome them."""
+    """Count the member, run the math CAPTCHA when enabled, then welcome them."""
     r = rk.get_redis()
     pipe = r.pipeline(transaction=False)
     pipe.pfadd(rk.STATS_MEMBERS, f"{chat_id}:{user.id}")
@@ -507,8 +593,10 @@ async def _greet(bot: Bot, chat_id: int, user) -> None:
     await pipe.execute()
 
     policy = await settings_store.get_policy(chat_id)
-    needs_captcha = policy.captcha_enabled and (
-        await rbac.get_role(chat_id, user.id) < Role.SUBADMIN
+    needs_captcha = (
+        policy.captcha_enabled
+        and await rbac.get_role(chat_id, user.id) < Role.SUBADMIN
+        and not await _is_verified(chat_id, user.id)
     )
     if needs_captcha and await _start_captcha(bot, chat_id, user):
         return  # the welcome is delivered once the CAPTCHA is answered
@@ -519,47 +607,74 @@ async def _greet(bot: Bot, chat_id: int, user) -> None:
 
 async def _send_welcome(bot: Bot, chat_id: int, user, template: str) -> None:
     try:
-        await bot.send_message(chat_id, _render_welcome(template, user, chat_id))
+        sent = await bot.send_message(
+            chat_id, _render_welcome(template, user, chat_id)
+        )
     except Exception:
         log.debug("welcome failed chat=%s", chat_id, exc_info=True)
+        return
+    _spawn(
+        delete_later(sent, 30),
+        name=f"welcome-del:{chat_id}:{sent.message_id}",
+    )
 
 
 async def _start_captcha(bot: Bot, chat_id: int, user) -> bool:
-    """
-    Mute the newcomer and ask for one inline confirmation.
-    Returns False when the restriction could not be applied (bot without admin
-    rights) - the caller then falls back to a plain welcome.
+    """Restrict the newcomer and ask a one-answer math challenge.
+
+    Returns False when the restriction or prompt could not be sent, so the
+    caller can fall back to a plain welcome.
     """
     r = rk.get_redis()
     key = _k_captcha(chat_id, user.id)
+    lock = f"{key}:lock"
     if await r.exists(key):
+        return True
+    if not await r.set(lock, "1", nx=True, ex=15):
         return True
 
     try:
-        await bot.restrict_chat_member(chat_id, user.id, permissions=NO_SEND)
-    except Exception:
-        log.debug("captcha restrict failed chat=%s user=%s", chat_id, user.id,
-                  exc_info=True)
-        return False
+        if await r.exists(key):
+            return True
+        try:
+            await bot.restrict_chat_member(chat_id, user.id, permissions=NO_SEND)
+        except Exception:
+            log.debug(
+                "captcha restrict failed chat=%s user=%s",
+                chat_id, user.id, exc_info=True,
+            )
+            return False
 
-    name = html.escape(user.full_name or str(user.id))
-    try:
-        prompt = await bot.send_message(
-            chat_id,
-            f"🛡 تایید عضویت\n"
-            f"به گروه خوش آمدی {name}!\n"
-            f"برای ارسال پیام، حداکثر تا {settings.captcha_timeout} ثانیه "
-            "دکمه زیر را بزنید.",
-            reply_markup=_verify_kb(chat_id, user.id),
+        question, answer = _math_challenge()
+        try:
+            prompt = await bot.send_message(
+                chat_id,
+                "🛡 <b>تایید هویت</b>\n\n"
+                "برای ارسال پیام، پاسخ عبارت ریاضی زیر را به صورت عدد صحیح بفرستید:\n\n"
+                f"<code>{question}</code>\n\n"
+                f"⏱ {settings.captcha_timeout} ثانیه",
+            )
+        except Exception:
+            log.debug("captcha prompt failed chat=%s", chat_id, exc_info=True)
+            return False
+
+        state = {"answer": answer, "prompt_id": prompt.message_id}
+        await r.set(
+            key,
+            json.dumps(state),
+            ex=settings.captcha_timeout + 10,
         )
-    except Exception:
-        log.debug("captcha prompt failed chat=%s", chat_id, exc_info=True)
-        return False
-
-    await r.set(key, str(prompt.message_id), ex=settings.captcha_timeout)
-    _spawn(_captcha_expiry(bot, chat_id, user.id, prompt.message_id),
-           name=f"captcha:{chat_id}:{user.id}")
-    return True
+        _spawn(
+            _captcha_expiry(bot, chat_id, user.id, prompt.message_id),
+            name=f"captcha:{chat_id}:{user.id}",
+        )
+        _spawn(
+            delete_later(prompt, settings.captcha_timeout + 10),
+            name=f"captcha-del:{chat_id}:{user.id}",
+        )
+        return True
+    finally:
+        await r.delete(lock)
 
 
 async def _captcha_expiry(bot: Bot, chat_id: int, user_id: int, prompt_id: int) -> None:
@@ -578,6 +693,152 @@ async def _captcha_expiry(bot: Bot, chat_id: int, user_id: int, prompt_id: int) 
         await bot.delete_message(chat_id, prompt_id)
     except Exception:
         pass
+
+
+async def _decline_join_request(bot: Bot, chat_id: int, user, reason: str) -> None:
+    try:
+        await bot.decline_chat_join_request(chat_id, user.id)
+    except Exception:
+        log.debug(
+            "join request decline failed chat=%s user=%s",
+            chat_id, user.id, exc_info=True,
+        )
+    log.info(
+        "JOIN REQUEST declined chat=%s user=%s reason=%s",
+        chat_id, user.id, reason,
+    )
+
+
+async def _complete_captcha(
+    bot: Bot, chat_id: int, user, answer_message_id: int, state: dict
+) -> None:
+    r = rk.get_redis()
+    if not await r.delete(_k_captcha(chat_id, user.id)):
+        return
+
+    prompt_id = state.get("prompt_id")
+    for message_id in (prompt_id, answer_message_id):
+        if isinstance(message_id, int):
+            try:
+                await bot.delete_message(chat_id, message_id)
+            except Exception:
+                pass
+
+    try:
+        await bot.restrict_chat_member(chat_id, user.id, permissions=FULL_SEND)
+    except Exception:
+        log.debug("captcha lift failed chat=%s", chat_id, exc_info=True)
+
+    await _mark_verified(chat_id, user.id)
+    policy = await settings_store.get_policy(chat_id)
+    await _send_welcome(
+        bot, chat_id, user, policy.welcome_text or DEFAULT_WELCOME
+    )
+    log.info("CAPTCHA passed chat=%s user=%s", chat_id, user.id)
+
+
+@captcha_router.chat_join_request()
+async def on_join_request(request: ChatJoinRequest, bot: Bot) -> None:
+    """Screen join requests, approve valid users, then start the math CAPTCHA."""
+    chat = request.chat
+    user = request.from_user
+    if chat.type not in {"group", "supergroup"}:
+        return
+
+    if not _profile_ok(user):
+        await _decline_join_request(bot, chat.id, user, "invalid profile/bot")
+        return
+
+    try:
+        photos = await bot.get_user_profile_photos(user.id, limit=1)
+    except Exception:
+        log.warning(
+            "join request photo check failed chat=%s user=%s",
+            chat.id, user.id, exc_info=True,
+        )
+        await _decline_join_request(bot, chat.id, user, "photo check failed")
+        return
+    if photos.total_count < 1:
+        await _decline_join_request(bot, chat.id, user, "no profile photo")
+        return
+
+    if not user.username:
+        log.info(
+            "join request user=%s has no username; profile still accepted",
+            user.id,
+        )
+
+    try:
+        await bot.approve_chat_join_request(chat.id, user.id)
+    except Exception:
+        log.warning(
+            "join request approve failed chat=%s user=%s",
+            chat.id, user.id, exc_info=True,
+        )
+        return
+    log.info("JOIN REQUEST approved chat=%s user=%s", chat.id, user.id)
+
+    policy = await settings_store.get_policy(chat.id)
+    needs_captcha = (
+        policy.captcha_enabled
+        and await rbac.get_role(chat.id, user.id) < Role.SUBADMIN
+        and not await _is_verified(chat.id, user.id)
+    )
+    if needs_captcha:
+        await asyncio.sleep(1.0)
+        if await _start_captcha(bot, chat.id, user):
+            return
+
+    await _send_welcome(
+        bot, chat.id, user, policy.welcome_text or DEFAULT_WELCOME
+    )
+
+
+@captcha_router.message(UnverifiedFilter())
+async def on_unverified_message(message: Message, bot: Bot) -> None:
+    """Delete every message from an unverified member except the exact answer."""
+    user = message.from_user
+    if user is None:
+        return
+    chat_id = message.chat.id
+    state = await _get_captcha_state(chat_id, user.id)
+    if state is None:
+        return
+
+    expected = state.get("answer")
+    answer = _normalize_answer(message.text)
+    if (
+        isinstance(expected, int)
+        and answer.isdigit()
+        and int(answer) == expected
+    ):
+        await _complete_captcha(
+            bot, chat_id, user, message.message_id, state
+        )
+        return
+
+    try:
+        await message.delete()
+    except Exception:
+        log.debug(
+            "unverified message delete failed chat=%s user=%s",
+            chat_id, user.id, exc_info=True,
+        )
+
+    try:
+        warning = await bot.send_message(
+            chat_id,
+            "لطفاً اول کپچا (تایید هویت انسان) را با ارسال عدد صحیح حل کنید.",
+        )
+        _spawn(
+            delete_later(warning, 12),
+            name=f"captcha-warn:{chat_id}:{user.id}",
+        )
+    except Exception:
+        log.debug(
+            "captcha warning failed chat=%s user=%s",
+            chat_id, user.id, exc_info=True,
+        )
 
 
 @router.callback_query(F.data.startswith("cap:"))
@@ -620,7 +881,9 @@ async def on_captcha_click(cq: CallbackQuery, bot: Bot) -> None:
             pass
 
     await cq.answer("✅ عضویت تایید شد.")
+    await _mark_verified(chat_id, user_id)
 
     policy = await settings_store.get_policy(chat_id)
-    if policy.welcome_text:
-        await _send_welcome(bot, chat_id, actor, policy.welcome_text)
+    await _send_welcome(
+        bot, chat_id, actor, policy.welcome_text or DEFAULT_WELCOME
+    )

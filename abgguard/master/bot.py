@@ -133,8 +133,9 @@ def create_master(token: str) -> tuple[Bot, Dispatcher]:
     dp = Dispatcher(storage=RedisStorage(redis=get_redis()))
 
     # router order is part of the contract:
-    #   help -> PV dashboard -> commands -> moderation -> active FSM
-    #        -> panel trigger -> guards -> membership
+    #   captcha screening -> help -> PV dashboard -> commands -> moderation
+    #        -> active FSM -> panel trigger -> guards -> membership
+    dp.include_router(members.captcha_router)
     dp.include_router(help_router)
     dp.include_router(pv_panel.fsm_router)
     dp.include_router(pv_panel.router)
