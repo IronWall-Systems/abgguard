@@ -22,6 +22,7 @@ from abgguard.master.keyboards import (
     panel_kb,
     state_label,
     subadmin_menu_kb,
+    tier_menu_kb,
     trigger_menu_kb,
 )
 from abgguard.master.states import PanelSG
@@ -398,47 +399,14 @@ async def on_panel_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> N
         )
         return
 
-    # ---- sub-admins (Level 2 + Level 3 only) -----------------------------
-    if action == "sa":
+    # ---- organizational tiers (Level 2 + Level 3 only) -------------------
+    if action in {"sa", "tiers"}:
         if role < Role.ADMIN:
             await _ack(cq, "❌ فقط ادمین گروه (Level 2)", alert=True)
             return
-        if len(parts) == 2:
-            subs = await rbac.list_subadmins(chat_id)
-            await _ack(cq)
-            await msg.edit_text(
-                "👥 مدیریت ساب‌ادمین‌ها\n"
-                f"تعداد: {len(subs)}\n\n"
-                "برای افزودن: ریپلای روی کاربر یا شناسه عددی.",
-                reply_markup=subadmin_menu_kb(subs),
-            )
-            return
-        if parts[2] == "del" and len(parts) > 3:
-            target = int(parts[3])
-            try:
-                await rbac.remove_subadmin(chat_id, target, requested_by=actor.id)
-            except PermissionError:
-                await _ack(cq, "❌ مجوز ندارید", alert=True)
-                return
-            subs = await rbac.list_subadmins(chat_id)
-            await _ack(cq, "حذف شد")
-            await msg.edit_text(
-                f"👥 مدیریت ساب‌ادمین‌ها\nتعداد: {len(subs)}",
-                reply_markup=subadmin_menu_kb(subs),
-            )
-            return
-        if parts[2] == "add":
-            await state.set_state(PanelSG.sub_admin_add)
-            await state.update_data(menu_msg=msg.message_id)
-            await _ack(cq)
-            await msg.edit_text(
-                "➕ افزودن ساب‌ادمین\n\n"
-                "روی پیام کاربر ریپلای کنید یا شناسه عددی تلگرام را بفرستید:\n"
-                "<code>123456789</code>\n\n"
-                "برای خروج دکمه 🔙 را بزنید.",
-                reply_markup=subadmin_menu_kb(await rbac.list_subadmins(chat_id)),
-            )
-            return
+        await _ack(cq)
+        await msg.edit_text(ui.TIERS_HELP_TEXT, reply_markup=tier_menu_kb())
+        return
 
     # ---- custom trigger name (Level 1 + Level 2 + Level 3) ---------------
     if action == "trg":

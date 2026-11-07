@@ -61,7 +61,9 @@ def panel_kb(
     ]
     if role >= Role.ADMIN:
         nav.append(
-            InlineKeyboardButton(text="👥 مدیریت ساب‌ادمین‌ها", callback_data="abg:sa")
+            InlineKeyboardButton(
+                text="🎖 مدیریت رده‌های سازمانی", callback_data="abg:tiers"
+            )
         )
     nav += [
         InlineKeyboardButton(
@@ -90,6 +92,19 @@ def panel_help_kb(
 
 def trigger_menu_kb() -> InlineKeyboardMarkup:
     """Back + close while typing a new panel trigger name."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=_with_close(
+            [
+                [
+                    InlineKeyboardButton(text="🔙 بازگشت", callback_data="abg:back"),
+                ]
+            ]
+        )
+    )
+
+
+def tier_menu_kb() -> InlineKeyboardMarkup:
+    """Read-only organizational hierarchy instructions."""
     return InlineKeyboardMarkup(
         inline_keyboard=_with_close(
             [

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 import time
 
 from aiogram import Bot, F, Router
@@ -942,39 +943,103 @@ async def on_vip_command(message: Message, bot: Bot) -> None:
 
 
 # --------------------------------------------------------- hierarchical RBAC --
-def _parse_role_command(text: str | None) -> tuple[str, str] | None:
-    """Parse a promotion/demotion command like 'نصب معاون' or 'عزل معاون'.
+_PERSIAN_TO_LATIN = str.maketrans(
+    "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+    "01234567890123456789",
+)
+_ARABIC_CHARS = str.maketrans("يك", "یک")
 
-    Returns (command_text, target_role) or None.
-    """
+
+def _normalize_role_text(text: str | None) -> str:
     raw = (text or "").strip()
+    if raw.startswith("/"):
+        raw = raw[1:].strip()
+    raw = raw.translate(_ARABIC_CHARS).translate(_PERSIAN_TO_LATIN)
+    return re.sub(r"\s+", " ", raw)
+
+
+_ROLE_ALIASES: tuple[tuple[str, str], ...] = tuple(
+    sorted(
+        (
+            (_normalize_role_text(alias), role)
+            for alias, role in hierarchy.PROMOTE_ALIASES.items()
+        ),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+)
+
+
+def _parse_role_command(text: str | None) -> tuple[str, str, int | None] | None:
+    """Parse a promotion/demotion command, optionally followed by a user id.
+
+    Returns ``(command_text, target_role, explicit_user_id)``. The id is
+    ``None`` when the command must resolve its target from the reply.
+    """
+    raw = _normalize_role_text(text)
     if not raw:
         return None
-    target_role = hierarchy.PROMOTE_ALIASES.get(raw)
-    if target_role is None:
-        return None
-    return raw, target_role
+    for alias, target_role in _ROLE_ALIASES:
+        if raw == alias:
+            return alias, target_role, None
+        if raw.startswith(alias + " "):
+            argument = raw[len(alias):].strip().split(maxsplit=1)[0]
+            target_id = int(argument) if argument.isdigit() else None
+            return alias, target_role, target_id
+    return None
+
+
+async def _effective_hierarchy_role(chat_id: int, user_id: int) -> str:
+    """Merge the organizational rank with the operational RBAC rank.
+
+    Group owners and God admins are not stored in the hierarchy until they are
+    explicitly promoted, so using only ``hierarchy.get_role`` made every
+    promotion command silently return for the people who own the group.
+    """
+    role = await hierarchy.get_role(chat_id, user_id)
+    operational = await rbac.get_role(chat_id, user_id)
+    mapped = {
+        Role.GOD: hierarchy.Role.GOD,
+        Role.ADMIN: hierarchy.Role.DEPUTY,
+    }.get(operational, hierarchy.Role.USER)
+    return role if hierarchy.level(role) >= hierarchy.level(mapped) else mapped
 
 
 async def _do_promote(
-    message: Message, bot: Bot, command_text: str, target_role: str
+    message: Message,
+    bot: Bot,
+    command_text: str,
+    target_role: str,
+    explicit_id: int | None = None,
 ) -> None:
-    """Promote/demote a replied-to user to a hierarchical role."""
+    """Promote/demote a replied-to user or an explicitly supplied Telegram id."""
     chat_id = message.chat.id
     actor = message.from_user
-    reply = message.reply_to_message
-    if actor is None or reply is None or chat_id is None:
-        return
-    target_user = reply.from_user
-    if target_user is None:
+    if actor is None or chat_id is None:
         return
 
-    target_id = target_user.id
+    target_name: str | None = None
+    if explicit_id is not None:
+        target_id = explicit_id
+    else:
+        reply = message.reply_to_message
+        target_user = reply.from_user if reply is not None else None
+        if target_user is None:
+            await notice(
+                message,
+                "❌ روی پیام کاربر ریپلای کنید یا شناسه عددی تلگرام را بعد از "
+                "دستور بفرستید.",
+                delay=7.0,
+            )
+            return
+        target_id = target_user.id
+        target_name = target_user.full_name
+
     if target_id == actor.id:
         await notice(message, "❌ نمی‌توانید مقام خودتان را تغییر دهید.", delay=7.0)
         return
 
-    actor_role = await hierarchy.get_role(chat_id, actor.id)
+    actor_role = await _effective_hierarchy_role(chat_id, actor.id)
     current_role = await hierarchy.get_role(chat_id, target_id)
     if not hierarchy.can_appoint(actor_role, target_role, current_role):
         await notice(
@@ -998,11 +1063,18 @@ async def _do_promote(
             can_pin_messages=perms.get("can_pin_messages", False),
             can_promote_members=perms.get("can_promote_members", False),
             can_manage_video_chats=perms.get("can_manage_video_chats", False),
-            can_manage_voice_chats=perms.get("can_manage_voice_chats", False),
         )
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
         log.warning("promote_chat_member failed: %s", exc)
-        await notice(message, "❌ نصب مقام در تلگرام انجام نشد.", delay=7.0)
+        await notice(
+            message,
+            f"❌ نصب مقام در تلگرام انجام نشد: <code>{html.escape(str(exc))}</code>",
+            delay=7.0,
+        )
+        return
+    except Exception:
+        log.exception("promote_chat_member crashed")
+        await notice(message, "❌ نصب مقام انجام نشد؛ خطای داخلی رخ داد.", delay=7.0)
         return
 
     # Custom title (no emojis, <= 16 chars)
@@ -1014,25 +1086,36 @@ async def _do_promote(
             )
         except (TelegramBadRequest, TelegramForbiddenError) as exc:
             log.warning("set custom title failed: %s", exc)
+        except Exception:
+            log.exception("set custom title crashed")
 
     # Keep the two authorization layers aligned.
-    if target_role == hierarchy.Role.USER:
-        await hierarchy.remove_role(chat_id, target_id)
-        await rbac.clear_operational_role(chat_id, target_id)
-        result = "✅ مقام کاربر حذف شد و دسترسی عملیاتی او هم‌تراز شد."
-    else:
-        await hierarchy.set_role(chat_id, target_id, target_role)
-        operational = HIERARCHY_OPERATIONAL_LEVEL.get(target_role)
-        if operational is not None:
-            await rbac.sync_operational_role(
-                chat_id, target_id, operational, granted_by=actor.id
-            )
-        result = "✅ کاربر به مقام منصوب شد، لقب و دسترسی عملیاتی دریافت کرد."
+    try:
+        if target_role == hierarchy.Role.USER:
+            await hierarchy.remove_role(chat_id, target_id)
+            await rbac.clear_operational_role(chat_id, target_id)
+            result = "✅ مقام کاربر حذف شد و دسترسی عملیاتی او هم‌تراز شد."
+        else:
+            await hierarchy.set_role(chat_id, target_id, target_role)
+            operational = HIERARCHY_OPERATIONAL_LEVEL.get(target_role)
+            if operational is not None:
+                await rbac.sync_operational_role(
+                    chat_id, target_id, operational, granted_by=actor.id
+                )
+            result = "✅ کاربر به مقام منصوب شد، لقب و دسترسی عملیاتی دریافت کرد."
+    except Exception:
+        log.exception("role persistence failed")
+        await notice(
+            message,
+            "⚠️ مقام در تلگرام اعمال شد، اما ذخیرهٔ داخلی انجام نشد. دوباره تلاش کنید.",
+            delay=7.0,
+        )
+        return
 
-    await notice(message, result, delay=7.0)
+    await notice(message, f"{result}\n👤 {_mention(target_id, target_name)}", delay=7.0)
     log.info(
-        "ROLE PROMOTE by %s on %s -> %s in %s",
-        actor.id, target_id, target_role, chat_id,
+        "ROLE PROMOTE by %s on %s -> %s in %s (%s)",
+        actor.id, target_id, target_role, chat_id, command_text,
     )
 
 
@@ -1047,10 +1130,13 @@ async def on_role_command(message: Message, bot: Bot) -> None:
     if actor is None or chat_id is None:
         return
 
-    # Only staff can use these commands
-    actor_role = await hierarchy.get_role(chat_id, actor.id)
-    if hierarchy.level(actor_role) < hierarchy.level(hierarchy.Role.ADMIN_CALL):
-        return
+    # Group owners must be able to bootstrap the hierarchy: they have an
+    # operational Level-2 role but no stored hierarchical role yet.
+    operational = await rbac.get_role(chat_id, actor.id)
+    if operational < Role.ADMIN:
+        actor_role = await hierarchy.get_role(chat_id, actor.id)
+        if hierarchy.level(actor_role) < hierarchy.level(hierarchy.Role.ADMIN_CALL):
+            return
 
-    command_text, target_role = parsed
-    await _do_promote(message, bot, command_text, target_role)
+    command_text, target_role, explicit_id = parsed
+    await _do_promote(message, bot, command_text, target_role, explicit_id)

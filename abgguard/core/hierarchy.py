@@ -123,6 +123,8 @@ PROMOTE_ALIASES: dict[str, str] = {
     "عزل ارشد چت": Role.USER,
     "نصب ارشد کال": Role.SENIOR_CALL,
     "عزل ارشد کال": Role.USER,
+    "نصب ادمین": Role.ADMIN_CHAT,
+    "عزل ادمین": Role.USER,
     "نصب ادمین چت": Role.ADMIN_CHAT,
     "عزل ادمین چت": Role.USER,
     "نصب ادمین کال": Role.ADMIN_CALL,

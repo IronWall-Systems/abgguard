@@ -371,7 +371,10 @@ def group_panel_kb(
     ]
     if role >= Role.ADMIN:
         second.append(
-            _b(badge(BLUE, "مدیریت ساب‌ادمین‌ها", "Sub-Admins"), f"pv:admin:sa:{chat_id}")
+            _b(
+                badge(BLUE, "مدیریت رده‌های سازمانی", "Organizational Tiers"),
+                f"pv:admin:tiers:{chat_id}",
+            )
         )
     rows.append(second)
     rows += _tail(back="pv:admin:groups")
@@ -395,6 +398,10 @@ def badwords_kb(chat_id: int, words: list[str]) -> InlineKeyboardMarkup:
 
 def badwords_input_kb(chat_id: int) -> InlineKeyboardMarkup:
     return _markup(*_tail(back=f"pv:admin:w:{chat_id}"))
+
+
+def tiers_kb(chat_id: int) -> InlineKeyboardMarkup:
+    return _markup(*_tail(back=f"pv:admin:g:{chat_id}"))
 
 
 def subadmins_kb(chat_id: int, subs: list[int], back: str | None = None) -> InlineKeyboardMarkup:

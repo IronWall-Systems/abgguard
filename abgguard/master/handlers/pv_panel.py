@@ -1146,9 +1146,9 @@ async def pv_admin_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> N
         await _badwords_route(cq, state, bot, parts, ids)
         return
 
-    # ---- sub-admins (Level 2 only) ------------------------------------------
-    if action == "sa" and len(parts) > 3:
-        await _subadmins_route(cq, state, bot, parts, user.id, ids)
+    # ---- organizational tiers (Level 2 only) --------------------------------
+    if action in {"sa", "tiers"} and len(parts) > 3:
+        await _tiers_route(cq, parts)
         return
 
     # ---- welcome & captcha ---------------------------------------------------
@@ -1390,6 +1390,20 @@ async def _badwords_route(
 
     await _ack(cq)
     await _edit(cq, _badwords_text(title, words), kb.badwords_kb(chat_id, words))
+
+
+async def _tiers_route(cq: CallbackQuery, parts: list[str]) -> None:
+    chat_id = _int_or_none(parts[4] if len(parts) > 4 else parts[3])
+    if chat_id is None:
+        await _ack(cq)
+        return
+
+    role = await _require_group(cq, chat_id, Role.ADMIN)
+    if role is None:
+        return
+
+    await _ack(cq)
+    await _edit(cq, ui.TIERS_HELP_TEXT, kb.tiers_kb(chat_id))
 
 
 async def _subadmins_route(

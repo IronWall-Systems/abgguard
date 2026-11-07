@@ -1,5 +1,15 @@
 # Agent Changelog
 
+## 2026-11-07 — Promotion Command Repair & Hierarchy UI
+
+### Promotion Commands
+- Root cause: `bot.promote_chat_member()` was called with the removed `can_manage_voice_chats` keyword, raising an uncaught `TypeError` that produced no group feedback. Removed the unsupported argument.
+- Group owners and God admins are now mapped into the organizational hierarchy for authorization, so the first promotion no longer silently returns because no stored hierarchy role exists yet.
+- Promotion commands now accept both replies and explicit numeric Telegram IDs, including Persian/Arabic digits, Arabic/Persian character variants, extra whitespace, and a leading slash.
+- Added generic aliases: `نصب ادمین` / `عزل ادمین` map to Chat Admin / User.
+- Missing targets, insufficient rank, Telegram API errors, and internal persistence failures now return visible feedback; unexpected exceptions are logged.
+- Replaced the generic sub-admin panel with the read-only organizational-tier instructions in group and PV panels; public help now hides the God tier.
+
 ## 2026-11-05 — Help Placement & Subscription Navigation Fix
 
 - Removed the full install/management tutorial from subscription status, trial, expiry, and payment cards.
