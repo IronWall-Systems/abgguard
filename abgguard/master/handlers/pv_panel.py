@@ -360,11 +360,17 @@ def _subadmins_text(title: str, subs: list[int], note: str | None = None) -> str
 
 def _policy_text(title: str, policy, note: str | None = None) -> str:
     captcha = "🟢 کپچای عضویت: فعال" if policy.captcha_enabled else "🔴 کپچای عضویت: غیرفعال"
+    auto = (
+        "🟢 تایید خودکار درخواست عضویت: فعال"
+        if policy.auto_approve_enabled
+        else "🔴 تایید خودکار درخواست عضویت: غیرفعال"
+    )
     lines = [
         "👋 پیام خوش‌آمد و کپچا",
         f"🏘 {_esc(title)}",
         "",
         captcha,
+        auto,
         f"⏱ مهلت تایید: {settings.captcha_timeout} ثانیه",
         "",
     ]
@@ -1176,6 +1182,24 @@ async def pv_admin_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> N
             return
         policy = await settings_store.get_policy(chat_id)
         await settings_store.set_captcha(chat_id, not policy.captcha_enabled)
+        policy = await settings_store.get_policy(chat_id)
+        await _ack(cq, "ذخیره شد ✅")
+        title = await _group_title(bot, chat_id)
+        await _edit(cq, _policy_text(title, policy), kb.policy_kb(chat_id, policy))
+        return
+
+    if action == "auto" and len(parts) > 3:
+        chat_id = _int_or_none(parts[3])
+        if chat_id is None:
+            await _ack(cq)
+            return
+        role = await _require_group(cq, chat_id, Role.SUBADMIN)
+        if role is None:
+            return
+        policy = await settings_store.get_policy(chat_id)
+        await settings_store.set_auto_approve(
+            chat_id, not policy.auto_approve_enabled
+        )
         policy = await settings_store.get_policy(chat_id)
         await _ack(cq, "ذخیره شد ✅")
         title = await _group_title(bot, chat_id)

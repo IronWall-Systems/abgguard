@@ -4,7 +4,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from abgguard.core.rbac import Role
-from abgguard.core.settings_store import RKEY, GroupFlags
+from abgguard.core.settings_store import RKEY, GroupFlags, GroupPolicyFlags
 from abgguard.models.entities import DEFAULT_TRIGGER_NAME
 
 # (field, emoji, label)
@@ -47,7 +47,10 @@ def lock_label(emoji: str, label: str, on: bool) -> str:
 
 
 def panel_kb(
-    flags: GroupFlags, role: Role, trigger: str = DEFAULT_TRIGGER_NAME
+    flags: GroupFlags,
+    role: Role,
+    trigger: str = DEFAULT_TRIGGER_NAME,
+    policy: GroupPolicyFlags | None = None,
 ) -> InlineKeyboardMarkup:
     toggles = [
         InlineKeyboardButton(
@@ -56,6 +59,18 @@ def panel_kb(
         )
         for field, emoji, label in TOGGLES
     ]
+    policy_toggles: list[InlineKeyboardButton] = []
+    if policy is not None:
+        policy_toggles = [
+            InlineKeyboardButton(
+                text=f"کپچا: {'✅' if policy.captcha_enabled else '❌'}",
+                callback_data="abg:pol:captcha",
+            ),
+            InlineKeyboardButton(
+                text=f"تایید خودکار: {'✅' if policy.auto_approve_enabled else '❌'}",
+                callback_data="abg:pol:auto",
+            ),
+        ]
     nav = [
         InlineKeyboardButton(text="🤬 مدیریت کلمات رکیک", callback_data="abg:bad"),
     ]
@@ -74,15 +89,20 @@ def panel_kb(
         InlineKeyboardButton(text="❓ راهنما", callback_data="abg:help"),
     ]
     return InlineKeyboardMarkup(
-        inline_keyboard=_with_close(_rows(toggles) + _rows(nav))
+        inline_keyboard=_with_close(
+            _rows(toggles) + _rows(policy_toggles) + _rows(nav)
+        )
     )
 
 
 def panel_help_kb(
-    flags: GroupFlags, role: Role, trigger: str = DEFAULT_TRIGGER_NAME
+    flags: GroupFlags,
+    role: Role,
+    trigger: str = DEFAULT_TRIGGER_NAME,
+    policy: GroupPolicyFlags | None = None,
 ) -> InlineKeyboardMarkup:
     """The help screen keeps the panel controls, adds Back, and keeps Close last."""
-    rows = list(panel_kb(flags, role, trigger).inline_keyboard)
+    rows = list(panel_kb(flags, role, trigger, policy).inline_keyboard)
     rows.insert(
         -1,
         [InlineKeyboardButton(text="🔙 بازگشت", callback_data="abg:back")],

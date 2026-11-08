@@ -1,5 +1,16 @@
 # Agent Changelog
 
+## 2026-11-08 — Feature: Captcha & Auto-Approve toggles (Tier 5+) + batch deleteMessages
+
+- Added per-chat `auto_approve_enabled` alongside `captcha_enabled` (both default `False`) to `GroupPolicy`, with an idempotent `ALTER TABLE` migration in `core/db.py`.
+- Extended `settings_store` with `GroupPolicyFlags.auto_approve_enabled`, Redis hash field `auto`, `set_auto_approve()`, and `toggle_policy()`.
+- Group panel (`panel_kb` / `panel_help_kb`) now shows two 2-column toggles with live status: `کپچا: ✅/❌` and `تایید خودکار: ✅/❌` (`abg:pol:captcha`, `abg:pol:auto`).
+- Added text commands: `قفل کپچا روشن/خاموش` and `قفل تایید خودکار روشن/خاموش`.
+- Restricted both UI toggles and text commands to Tier 6 (God) and Tier 5 (Deputy / group owner); lower tiers get an `answer_callback_query(..., show_alert=True)` denial.
+- `chat_join_request` now approves only when `auto_approve_enabled` is on and runs the 5-second math captcha only when `captcha_enabled` is on.
+- PV dashboard policy page now also exposes the auto-approve toggle and shows both statuses.
+- Replaced the one-by-one `_do_wipe_all` loop with chunked `bot.delete_messages` batches of 100 (with one-by-one fallback per failed chunk), dramatically speeding up full-history wipes.
+
 ## 2026-11-07 — Fix: Restore broken promote/demote commands after custom title refactor
 
 - Fixed `ValueError: too many values to unpack` in `on_role_command` caused by `_parse_role_command_details` still returning 4 values while the caller unpacked only 3.

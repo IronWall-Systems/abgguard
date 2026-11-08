@@ -671,6 +671,7 @@ async def _do_wipe(message: Message, bot) -> None:
 
 
 WIPE_ALL_DEPTH = 10000
+WIPE_ALL_CHUNK = 100
 WIPE_ALL_SLEEP = 0.05
 
 
@@ -694,9 +695,10 @@ async def _do_wipe_all(message: Message, bot) -> None:
     """Delete history backwards from the current message down to message_id 1.
 
     Uses the Local Telegram Bot API (port 8081) to bypass the 48-hour cloud
-    restriction. Iterates backward one-by-one so the deleted count is accurate
-    (Telegram's delete_messages can return True even when admin messages
-    cannot be deleted). Logs each failure so the exact reason is visible.
+    restriction. Message ids are collected and deleted in chunks of 100 via
+    `delete_messages` (Telegram's per-request limit), which is far faster than
+    the previous one-by-one loop. A failed chunk falls back to single deletes so
+    the count stays as accurate as possible.
     """
     chat_id = message.chat.id
     current_id = message.message_id
@@ -705,42 +707,75 @@ async def _do_wipe_all(message: Message, bot) -> None:
     skipped_count = 0
     start_time = time.time()
 
+    ids = list(range(current_id, floor - 1, -1))
+    total = len(ids)
+
     log.info(
-        "WIPE ALL START chat=%s current_id=%d floor=%d depth=%d",
-        chat_id, current_id, floor, WIPE_ALL_DEPTH,
+        "WIPE ALL START chat=%s current_id=%d floor=%d depth=%d total=%d",
+        chat_id, current_id, floor, WIPE_ALL_DEPTH, total,
     )
 
-    # Walk backward one-by-one for accurate counting
-    for message_id in range(current_id, floor - 1, -1):
+    stop = False
+    for offset in range(0, total, WIPE_ALL_CHUNK):
+        if stop:
+            break
+        chunk = ids[offset:offset + WIPE_ALL_CHUNK]
         try:
-            if await bot.delete_message(chat_id, message_id):
-                deleted_count += 1
-                log.debug("WIPE ALL deleted chat=%d msg_id=%d", chat_id, message_id)
-            else:
-                skipped_count += 1
-                log.debug(
-                    "WIPE ALL skipped chat=%d msg_id=%d (delete_message returned False)",
-                    chat_id, message_id,
-                )
-        except TelegramBadRequest as exc:
-            skipped_count += 1
+            await bot.delete_messages(chat_id=chat_id, message_ids=chunk)
+            deleted_count += len(chunk)
             log.debug(
-                "WIPE ALL skipped chat=%d msg_id=%d: %s",
-                chat_id, message_id, exc,
+                "WIPE ALL chunk deleted chat=%d ids=%d..%d",
+                chat_id, chunk[0], chunk[-1],
             )
         except TelegramForbiddenError as exc:
-            skipped_count += 1
+            skipped_count += len(chunk)
             log.warning(
-                "WIPE ALL forbidden chat=%d msg_id=%d: %s",
-                chat_id, message_id, exc,
+                "WIPE ALL forbidden chat=%d ids=%d..%d: %s",
+                chat_id, chunk[0], chunk[-1], exc,
             )
             break  # bot lost admin rights, stop wiping
-        except Exception as exc:
-            skipped_count += 1
+        except TelegramBadRequest as exc:
             log.debug(
-                "WIPE ALL skipped chat=%d msg_id=%d: %s",
-                chat_id, message_id, exc,
+                "WIPE ALL chunk failed chat=%d ids=%d..%d: %s; falling back",
+                chat_id, chunk[0], chunk[-1], exc,
             )
+        except Exception as exc:
+            log.debug(
+                "WIPE ALL chunk failed chat=%d ids=%d..%d: %s; falling back",
+                chat_id, chunk[0], chunk[-1], exc,
+            )
+        else:
+            # Small delay between successful batches to avoid FloodWait.
+            await asyncio.sleep(WIPE_ALL_SLEEP)
+            continue
+
+        # Fallback: delete the failed chunk one-by-one for accurate counting.
+        for message_id in chunk:
+            try:
+                if await bot.delete_message(chat_id, message_id):
+                    deleted_count += 1
+                else:
+                    skipped_count += 1
+            except TelegramForbiddenError as exc:
+                skipped_count += 1
+                log.warning(
+                    "WIPE ALL forbidden chat=%d msg_id=%d: %s",
+                    chat_id, message_id, exc,
+                )
+                stop = True  # bot lost admin rights, stop wiping
+                break
+            except TelegramBadRequest as exc:
+                skipped_count += 1
+                log.debug(
+                    "WIPE ALL skipped chat=%d msg_id=%d: %s",
+                    chat_id, message_id, exc,
+                )
+            except Exception as exc:
+                skipped_count += 1
+                log.debug(
+                    "WIPE ALL skipped chat=%d msg_id=%d: %s",
+                    chat_id, message_id, exc,
+                )
 
         # Small delay to avoid FloodWait
         await asyncio.sleep(WIPE_ALL_SLEEP)

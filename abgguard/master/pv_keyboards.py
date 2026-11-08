@@ -421,8 +421,14 @@ def policy_kb(chat_id: int, policy: GroupPolicyFlags, back: str | None = None) -
         if policy.captcha_enabled
         else badge(RED, "کپچای عضویت غیرفعال", "Captcha Off")
     )
+    auto = (
+        badge(GREEN, "تایید خودکار فعال", "Auto-Approve On")
+        if policy.auto_approve_enabled
+        else badge(RED, "تایید خودکار غیرفعال", "Auto-Approve Off")
+    )
     rows: list[list[InlineKeyboardButton]] = [
         [_b(captcha, f"pv:admin:cap:{chat_id}")],
+        [_b(auto, f"pv:admin:auto:{chat_id}")],
         [_b(badge(BLUE, "تنظیم پیام خوش‌آمد", "Set Welcome"), f"pv:admin:wel:{chat_id}")],
     ]
     if policy.welcome_text:

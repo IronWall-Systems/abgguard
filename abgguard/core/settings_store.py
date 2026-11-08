@@ -220,6 +220,7 @@ async def contains_badword(chat_id: int, text: str) -> str | None:
 class GroupPolicyFlags:
     chat_id: int
     captcha_enabled: bool = False
+    auto_approve_enabled: bool = False
     welcome_text: str | None = None
 
 
@@ -236,14 +237,21 @@ async def get_policy(chat_id: int) -> GroupPolicyFlags:
         return GroupPolicyFlags(
             chat_id,
             captcha_enabled=raw.get("captcha") == "1",
+            auto_approve_enabled=raw.get("auto") == "1",
             welcome_text=raw.get("welcome") or None,
         )
 
     row = await _ensure_policy(chat_id)
-    flags = GroupPolicyFlags(chat_id, row.captcha_enabled, row.welcome_text)
+    flags = GroupPolicyFlags(
+        chat_id,
+        captcha_enabled=row.captcha_enabled,
+        auto_approve_enabled=row.auto_approve_enabled,
+        welcome_text=row.welcome_text,
+    )
     await r.hset(
         rk.k_policy(chat_id),
         mapping={"captcha": "1" if flags.captcha_enabled else "0",
+                 "auto": "1" if flags.auto_approve_enabled else "0",
                  "welcome": flags.welcome_text or ""},
     )
     return flags
@@ -254,6 +262,26 @@ async def set_captcha(chat_id: int, value: bool) -> None:
     row.captcha_enabled = value
     await row.save(update_fields=["captcha_enabled"])
     await rk.get_redis().hset(rk.k_policy(chat_id), mapping={"captcha": "1" if value else "0"})
+
+
+async def set_auto_approve(chat_id: int, value: bool) -> None:
+    row = await _ensure_policy(chat_id)
+    row.auto_approve_enabled = value
+    await row.save(update_fields=["auto_approve_enabled"])
+    await rk.get_redis().hset(rk.k_policy(chat_id), mapping={"auto": "1" if value else "0"})
+
+
+async def toggle_policy(chat_id: int, field_name: str) -> GroupPolicyFlags:
+    """Flip one policy boolean and return the refreshed flags."""
+    if field_name not in {"captcha_enabled", "auto_approve_enabled"}:
+        raise KeyError(field_name)
+    policy = await get_policy(chat_id)
+    new_value = not getattr(policy, field_name)
+    if field_name == "captcha_enabled":
+        await set_captcha(chat_id, new_value)
+    else:
+        await set_auto_approve(chat_id, new_value)
+    return await get_policy(chat_id)
 
 
 async def set_welcome(chat_id: int, text: str | None) -> None:

@@ -24,6 +24,7 @@ async def init_db() -> None:
     await Tortoise.init(config=TORTOISE_ORM)
     await Tortoise.generate_schemas(safe=True)
     await _ensure_trigger_column()
+    await _ensure_policy_columns()
     log.info("PostgreSQL (Tortoise ORM) ready")
 
 
@@ -45,6 +46,20 @@ async def _ensure_trigger_column() -> None:
         # an unsupported backend / read-only role must not block boot: the
         # trigger store falls back to the default trigger name instead
         log.warning("could not ensure groups.trigger_name column", exc_info=True)
+
+
+async def _ensure_policy_columns() -> None:
+    """Add the per-group policy toggles that predate this schema version."""
+    ddl = (
+        "ALTER TABLE group_policy "
+        "ADD COLUMN IF NOT EXISTS auto_approve_enabled BOOLEAN "
+        "NOT NULL DEFAULT FALSE"
+    )
+    try:
+        conn = Tortoise.get_connection("default")
+        await conn.execute_query(ddl)
+    except Exception:
+        log.warning("could not ensure group_policy.auto_approve_enabled column", exc_info=True)
 
 
 async def close_db() -> None:

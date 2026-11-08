@@ -86,6 +86,7 @@ class GroupPolicy(BaseModel):
 
     chat_id = fields.BigIntField(unique=True, index=True)
     captcha_enabled = fields.BooleanField(default=False)
+    auto_approve_enabled = fields.BooleanField(default=False)
     welcome_text = fields.CharField(max_length=500, null=True)
 
     class Meta:

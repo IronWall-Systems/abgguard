@@ -768,10 +768,20 @@ async def _delayed_join_captcha(bot: Bot, chat_id: int, user) -> None:
 
 @captcha_router.chat_join_request()
 async def on_join_request(request: ChatJoinRequest, bot: Bot) -> None:
-    """Approve every join request immediately, then delay the CAPTCHA 5s."""
+    """Respect the group policy: auto-approve and/or run the CAPTCHA."""
     chat = request.chat
     user = request.from_user
     if chat.type not in {"group", "supergroup"} or user is None:
+        return
+
+    policy = await settings_store.get_policy(chat.id)
+
+    # No auto-approval: leave the request pending for a human admin.
+    if not policy.auto_approve_enabled:
+        log.info(
+            "JOIN REQUEST left pending (auto-approve off) chat=%s user=%s",
+            chat.id, user.id,
+        )
         return
 
     r = rk.get_redis()
@@ -787,6 +797,11 @@ async def on_join_request(request: ChatJoinRequest, bot: Bot) -> None:
         return
 
     log.info("JOIN REQUEST approved chat=%s user=%s", chat.id, user.id)
+
+    # CAPTCHA only when explicitly enabled for this group.
+    if not policy.captcha_enabled:
+        return
+
     _spawn(
         _delayed_join_captcha(bot, chat.id, user),
         name=f"join-captcha:{chat.id}:{user.id}",

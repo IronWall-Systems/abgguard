@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from abgguard.core import groups as groups_store
-from abgguard.core import rbac, settings_store
+from abgguard.core import hierarchy, rbac, settings_store
 from abgguard.core import trigger as trigger_store
 from abgguard.core.rbac import Role
 from abgguard.core.settings_store import INV_RKEY, GroupFlags
@@ -41,6 +41,37 @@ RBAC_REJECT = "⛔️ فقط ادمین‌ها و ساب‌ادمین‌های �
 
 HELP_TEXT = ui.public_help_text()
 
+# Captcha / auto-approve text toggles (Tier 5+ only).
+POLICY_COMMANDS: dict[str, tuple[str, bool]] = {
+    "قفل کپچا روشن": ("captcha_enabled", True),
+    "قفل کپچا خاموش": ("captcha_enabled", False),
+    "قفل تایید خودکار روشن": ("auto_approve_enabled", True),
+    "قفل تایید خودکار خاموش": ("auto_approve_enabled", False),
+}
+POLICY_DENIED = (
+    "⛔️ فقط گاد ادمین یا معاون (Tier 5+) می‌تواند کپچا و تایید خودکار را تغییر دهد."
+)
+
+
+class PolicyTrigger(Filter):
+    """Matches the exact captcha / auto-approve text toggles."""
+
+    async def __call__(self, message: Message) -> bool:
+        if message.chat.type not in {"group", "supergroup"}:
+            return False
+        return (message.text or "").strip() in POLICY_COMMANDS
+
+
+async def _can_manage_policy(chat_id: int, user_id: int) -> bool:
+    """Tier 6 (God) and Tier 5 (Deputy / group owner) only."""
+    if await rbac.is_god(user_id):
+        return True
+    hier_role = await hierarchy.get_role(chat_id, user_id)
+    if hierarchy.level(hier_role) >= hierarchy.level(hierarchy.Role.DEPUTY):
+        return True
+    # Operational Level 2 (group owner) is the Deputy equivalent.
+    return await rbac.get_role(chat_id, user_id) >= Role.ADMIN
+
 
 # ------------------------------------------------------------------ utils --
 class PanelTrigger(Filter):
@@ -62,11 +93,12 @@ class PanelTrigger(Filter):
 
 async def _render(target: Message, chat_id: int, role: Role) -> bool:
     flags = await settings_store.get_flags(chat_id)
+    policy = await settings_store.get_policy(chat_id)
     trigger = await trigger_store.get_trigger(chat_id)
     try:
         await target.edit_text(
             _panel_text(chat_id, role, flags),
-            reply_markup=panel_kb(flags, role, trigger),
+            reply_markup=panel_kb(flags, role, trigger, policy),
         )
         return True
     except Exception as exc:  # message not modified, identical text, ...
@@ -111,9 +143,11 @@ async def open_panel(message: Message, state: FSMContext | None = None) -> None:
         return
 
     flags = await settings_store.get_flags(chat_id)
+    policy = await settings_store.get_policy(chat_id)
     trigger = await trigger_store.get_trigger(chat_id)
     await message.answer(
-        _panel_text(chat_id, role, flags), reply_markup=panel_kb(flags, role, trigger)
+        _panel_text(chat_id, role, flags),
+        reply_markup=panel_kb(flags, role, trigger, policy),
     )
     log.info(
         "PANEL open chat=%s trigger=%s by=%s role=%s",
@@ -128,6 +162,30 @@ async def open_panel(message: Message, state: FSMContext | None = None) -> None:
 @router.message(PanelTrigger())
 async def panel_trigger(message: Message, state: FSMContext) -> None:
     await open_panel(message, state)
+
+
+# ------------------------------------------------ policy text toggles ------
+@router.message(PolicyTrigger())
+async def policy_toggle_command(message: Message) -> None:
+    user = message.from_user
+    if user is None:
+        return
+    chat_id = message.chat.id
+    if not await _can_manage_policy(chat_id, user.id):
+        await notice(message, POLICY_DENIED)
+        return
+    command = (message.text or "").strip()
+    field, value = POLICY_COMMANDS[command]
+    if field == "captcha_enabled":
+        await settings_store.set_captcha(chat_id, value)
+    else:
+        await settings_store.set_auto_approve(chat_id, value)
+    label = "کپچا" if field == "captcha_enabled" else "تایید خودکار"
+    await notice(
+        message,
+        f"{'✅' if value else '❌'} {label} برای این گروه "
+        f"{'فعال' if value else 'غیرفعال'} شد.",
+    )
 
 
 # ------------------------------------------------------------------ FSM ----
@@ -256,6 +314,7 @@ async def trigger_name_input(message: Message, state: FSMContext, bot: Bot) -> N
 
     role = await rbac.get_role(chat_id, user.id)
     flags = await settings_store.get_flags(chat_id)
+    policy = await settings_store.get_policy(chat_id)
     menu_id = data.get("menu_msg")
     if menu_id:
         try:
@@ -263,14 +322,14 @@ async def trigger_name_input(message: Message, state: FSMContext, bot: Bot) -> N
                 chat_id=chat_id,
                 message_id=int(menu_id),
                 text=_panel_text(chat_id, role, flags),
-                reply_markup=panel_kb(flags, role, new_name),
+                reply_markup=panel_kb(flags, role, new_name, policy),
             )
         except Exception as exc:
             log.debug("panel refresh after rename failed: %s", exc)
     else:
         await message.answer(
             _panel_text(chat_id, role, flags),
-            reply_markup=panel_kb(flags, role, new_name),
+            reply_markup=panel_kb(flags, role, new_name, policy),
         )
 
 
@@ -356,10 +415,35 @@ async def on_panel_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> N
             return
         flags = await settings_store.toggle(chat_id, field)
         trigger = await trigger_store.get_trigger(chat_id)
+        policy = await settings_store.get_policy(chat_id)
         await _ack(cq, "تغییر ذخیره شد ✅")
         await msg.edit_text(
             _panel_text(chat_id, role, flags),
-            reply_markup=panel_kb(flags, role, trigger),
+            reply_markup=panel_kb(flags, role, trigger, policy),
+        )
+        return
+
+    # ---- captcha / auto-approve policy toggles (Tier 5+ only) ------------
+    if action == "pol" and len(parts) > 2:
+        if not await _can_manage_policy(chat_id, cq.from_user.id):
+            await _ack(cq, POLICY_DENIED, alert=True)
+            return
+        field = {
+            "captcha": "captcha_enabled",
+            "auto": "auto_approve_enabled",
+        }.get(parts[2])
+        if field is None:
+            await _ack(cq)
+            return
+        policy = await settings_store.toggle_policy(chat_id, field)
+        flags = await settings_store.get_flags(chat_id)
+        trigger = await trigger_store.get_trigger(chat_id)
+        label = "کپچا" if field == "captcha_enabled" else "تایید خودکار"
+        state = getattr(policy, field)
+        await _ack(cq, f"{label}: {'فعال ✅' if state else 'غیرفعال ❌'}")
+        await msg.edit_text(
+            _panel_text(chat_id, role, flags),
+            reply_markup=panel_kb(flags, role, trigger, policy),
         )
         return
 
@@ -464,6 +548,7 @@ async def on_panel_callback(cq: CallbackQuery, state: FSMContext, bot: Bot) -> N
                 await settings_store.get_flags(chat_id),
                 role,
                 await trigger_store.get_trigger(chat_id),
+                await settings_store.get_policy(chat_id),
             ),
         )
         return
