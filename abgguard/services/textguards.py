@@ -339,8 +339,11 @@ def _fight_pattern(word: str) -> re.Pattern[str]:
     if not src:
         return _NEVER
     body = _GLUE.join(re.escape(ch) for ch in src)
+    # Strict left boundary even for the optional "بی" prefix: an embedded
+    # prefix inside a longer word (e.g. ...بیکسکش) must not fire.  The right
+    # side only allows an inflected ending or a true word boundary.
     return re.compile(
-        rf"(?:(?<![{_LETTERS}])|{_PREFIX}){body}"
+        rf"(?<![{_LETTERS}])(?:{_PREFIX})?{body}"
         rf"(?:(?![{_LETTERS}])|{_INFL}+(?![{_LETTERS}]))"
     )
 
@@ -348,10 +351,13 @@ def _fight_pattern(word: str) -> re.Pattern[str]:
 def find_fight_word(text: str, words: Iterable[str]) -> str | None:
     """Return the first blacklist word that hits ``text``, else ``None``.
 
-    Persian word boundaries keep lookalikes legal (کلونی vs کونی, ناموس vs
-    بی‌ناموس, کشیدن vs کسکش) while the glue class defeats spaced / dotted /
-    ZWNJ / kashida / harakat / digit smuggling.  Suffixes and the بی prefix
-    still hit, so کسکشی and بی‌کسکش are not missed.
+    Matching is strict whole-word: a list entry only fires when it stands as
+    an independent token.  Persian word boundaries keep lookalikes legal
+    (کلونی vs کونی, ناموس vs بی‌ناموس, کشیدن vs کسکش, بگیم vs a shorter entry
+    inside it) while the glue class still defeats spaced / dotted / ZWNJ /
+    kashida / harakat / digit smuggling.  Productive suffixes and the بی
+    prefix remain recognised (کسکشی، بی‌کسکش) without matching substrings of
+    longer words.
     """
     if not text or not words:
         return None

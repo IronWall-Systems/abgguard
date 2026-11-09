@@ -8,7 +8,6 @@ from abgguard.core import redis as rk
 from abgguard.models.entities import BadWord, GroupPolicy, GroupSettings, PaymentMethod
 from abgguard.services.textguards import (
     DEFAULT_FIGHT_WORDS,
-    find_badword_root,
     find_fight_word,
 )
 
@@ -135,6 +134,31 @@ async def set_flag(chat_id: int, field_name: str, value: bool) -> None:
 # --------------------------------------------------------------------------
 # bad words
 # --------------------------------------------------------------------------
+BADWORDS_TTL = 3600  # seconds the Redis snapshot may live before re-reading DB
+
+# Last list logged per chat: keeps the console readable while still printing
+# the active list whenever it is (re)loaded or changed.
+_BADWORDS_LOGGED: dict[int, frozenset[str]] = {}
+
+
+def _log_badwords(
+    chat_id: int, words: set[str] | list[str] | tuple[str, ...], source: str,
+    *, force: bool = False,
+) -> None:
+    """Print the active blacklist so operators can see what the filter holds."""
+    snapshot = frozenset(w.lower() for w in words)
+    if not force and _BADWORDS_LOGGED.get(chat_id) == snapshot:
+        return
+    _BADWORDS_LOGGED[chat_id] = snapshot
+    log.info(
+        "BADWORDS %s chat=%s count=%d words=[%s]",
+        source,
+        chat_id,
+        len(snapshot),
+        ", ".join(sorted(snapshot)),
+    )
+
+
 async def _seed_default_badwords(chat_id: int) -> list[str]:
     """Install the high-severity fight floor for a group.
 
@@ -148,6 +172,7 @@ async def _seed_default_badwords(chat_id: int) -> list[str]:
             chat_id=chat_id, word=word, defaults={"added_by": None}
         )
     log.info("badword floor seeded chat=%s words=%d", chat_id, len(DEFAULT_FIGHT_WORDS))
+    _log_badwords(chat_id, DEFAULT_FIGHT_WORDS, "seeded", force=True)
     return list(DEFAULT_FIGHT_WORDS)
 
 
@@ -155,17 +180,21 @@ async def load_badwords(chat_id: int) -> set[str]:
     r = rk.get_redis()
     cached = await r.smembers(rk.k_badwords(chat_id))
     if cached:
-        return {w.lower() for w in cached}
+        words = {w.lower() for w in cached}
+        _log_badwords(chat_id, words, "redis-cache")
+        return words
 
     rows = await BadWord.filter(chat_id=chat_id).values_list("word", flat=True)
     if not rows:
         rows = await _seed_default_badwords(chat_id)
+    words = {w.lower() for w in rows}
     if rows:
         pipe = r.pipeline(transaction=False)
         pipe.sadd(rk.k_badwords(chat_id), *rows)
-        pipe.expire(rk.k_badwords(chat_id), 3600)
+        pipe.expire(rk.k_badwords(chat_id), BADWORDS_TTL)
         await pipe.execute()
-    return {w.lower() for w in rows}
+    _log_badwords(chat_id, words, "postgres", force=True)
+    return words
 
 
 async def add_badwords(chat_id: int, words: list[str], added_by: int) -> int:
@@ -178,39 +207,54 @@ async def add_badwords(chat_id: int, words: list[str], added_by: int) -> int:
             chat_id=chat_id, word=word, defaults={"added_by": added_by}
         )
         added += int(created)
+    if added:
+        log.info(
+            "BADWORDS added chat=%s by=%s words=[%s]",
+            chat_id, added_by, ", ".join(words),
+        )
     await load_badwords_refresh(chat_id)
     return added
 
 
 async def remove_badword(chat_id: int, word: str) -> bool:
     deleted = await BadWord.filter(chat_id=chat_id, word=word.strip().lower()).delete()
+    if deleted:
+        log.info("BADWORDS removed chat=%s word=%s", chat_id, word)
     await load_badwords_refresh(chat_id)
     return bool(deleted)
 
 
 async def load_badwords_refresh(chat_id: int) -> None:
+    """Re-read the authoritative PostgreSQL list and refresh the Redis cache."""
     r = rk.get_redis()
     await r.delete(rk.k_badwords(chat_id))
     rows = await BadWord.filter(chat_id=chat_id).values_list("word", flat=True)
+    words = {w.lower() for w in rows}
     if rows:
-        await r.sadd(rk.k_badwords(chat_id), *rows)
+        pipe = r.pipeline(transaction=False)
+        pipe.sadd(rk.k_badwords(chat_id), *rows)
+        pipe.expire(rk.k_badwords(chat_id), BADWORDS_TTL)
+        await pipe.execute()
+    _log_badwords(chat_id, words, "refreshed", force=True)
 
 
 async def contains_badword(chat_id: int, text: str) -> str | None:
-    """Anti-bypass probe: normalised, word-boundary aware match that returns
-    the blacklist entry which fired (for the strike notice).
+    """Whole-word match against the admin-managed blacklist.
 
-    The admin-managed list is checked first (it keeps its lookalike-safe
-    boundaries); the always-on advanced floor then catches spaced, dotted,
-    ZWNJ-separated and repeated-character obfuscation.
+    The list stored in the admin panel (PostgreSQL ``bad_words``, mirrored to
+    Redis) is the single source of truth; there is no separate hard-coded
+    floor.  ``find_fight_word`` applies strict Persian word boundaries, so an
+    entry only fires when it is an independent word (e.g. the harmless
+    ``بگیم`` can never match a shorter entry inside it).
     """
     if not text:
         return None
     words = await load_badwords(chat_id)
     hit = find_fight_word(text, words) if words else None
-    if hit is not None:
-        return hit
-    return find_badword_root(text)
+    log.debug(
+        "BADWORDS check chat=%s active=%d hit=%s", chat_id, len(words), hit
+    )
+    return hit
 
 
 # --------------------------------------------------------------------------

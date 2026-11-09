@@ -389,8 +389,7 @@ def test_obfuscated_severe_word_is_still_caught(master, monkeypatch) -> None:
 
 def test_mild_gslang_passes_and_reaches_the_dataset(master, monkeypatch) -> None:
     _install(monkeypatch)
-    # گوه / کصشعر are now part of the advanced floor, so they are not in the
-    # "still legal" sample any more.
+    # Only the admin-managed list drives the filter now; no hard-coded floor.
     text = "اسکل و دلقک و تخمی و پشمام"
     _feed(master, text)
 
