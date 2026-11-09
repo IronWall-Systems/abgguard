@@ -8,6 +8,15 @@
 - Strengthened whole-word matching in `find_fight_word`: the optional `بی` prefix now also requires a strict left word boundary, so a prefixed entry embedded inside a longer word (e.g. `کتابیکسکش`) can never fire. Independent words, common inflections (`کسکشی`), and obfuscation glue (`کص.ننت`, `ک‌ونی`, spacing/digits) still match.
 - Updated the corresponding test comment to reflect that only the admin list drives the filter.
 
+## 2026-11-09 — Fix: Sync profanity filter with admin panel, log bad words, whole-word matching
+
+- The admin-managed `bad_words` table (PostgreSQL, mirrored to Redis) is now the single source of truth for the profanity filter; the separate hard-coded aggressive word floor is no longer applied, so harmless words like `بگیم` are not flagged.
+- `settings_store.load_badwords()` / `load_badwords_refresh()` now log the active blacklist (`BADWORDS <source> chat=... count=... words=[...]`) whenever it is loaded, fetched, refreshed, seeded, added to, or removed from. Repeated per-message cache reads are de-duplicated so logs stay readable.
+- Redis snapshots are refreshed on panel/PV changes and given the same TTL on both the initial load and refresh paths.
+- Strengthened whole-word matching in `find_fight_word`: the optional `بی` prefix now also requires a strict left word boundary, so a prefixed entry embedded inside a longer word (e.g. `کتابیکسکش`) can never fire. Independent words, common inflections (`کسکشی`), and obfuscation glue (`کص.ننت`, `ک‌ونی`, spacing/digits) still match.
+- Bulk addition of new forbidden words and phrases from the admin task list, handled gracefully with `get_or_create` (skips duplicates, inserts new ones). Redis cache refreshed immediately after sync so the new words take effect right away.
+- Updated the corresponding test comment to reflect that only the admin list drives the filter.
+
 ## 2026-11-08 — Feature: Captcha & Auto-Approve toggles (Tier 5+) + batch deleteMessages
 
 - Added per-chat `auto_approve_enabled` alongside `captcha_enabled` (both default `False`) to `GroupPolicy`, with an idempotent `ALTER TABLE` migration in `core/db.py`.
